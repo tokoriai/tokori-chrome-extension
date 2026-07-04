@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Tokori Companion",
+  "version": "0.1.0",
+  "description": "Hover over text on any website to see dictionary definitions, mine YouTube subtitles, and push vocab / articles / videos straight into Tokori — local-first with optional cloud sync.",
+  "permissions": ["activeTab", "storage", "scripting", "alarms", "tabs"],
+  "externally_connectable": {
+    "matches": [
+      "https://app.tokori.ai/*",
+      "https://tokori.ai/*",
+      "http://localhost:3001/*",
+      "http://127.0.0.1:3001/*"
+    ]
+  },
+  "host_permissions": [
+    "http://127.0.0.1:53210/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:3001/*",
+    "http://127.0.0.1:3001/*",
+    "https://api.tokori.ai/*",
+    "https://app.tokori.ai/*",
+    "https://api.openai.com/*",
+    "https://api.anthropic.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://www.youtube.com/*",
+    "https://www.mdbg.net/*",
+    "https://ftp.edrdg.org/*"
+  ],
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.tsx"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["src/content/youtube-cues.ts"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "16": "src/icons/icon-16.png",
+    "48": "src/icons/icon-48.png",
+    "128": "src/icons/icon-128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Tokori Companion",
+    "default_icon": {
+      "16": "src/icons/icon-16.png",
+      "48": "src/icons/icon-48.png",
+      "128": "src/icons/icon-128.png"
+    }
+  }
+}

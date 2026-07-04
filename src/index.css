@@ -1,0 +1,205 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+/* Same typeface the Tokori desktop app ships (@fontsource/inter). */
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* Map shadcn-nova's shorthand utilities (`data-checked:`,
+ * `data-unchecked:`, `data-open:`, etc.) to the actual data-state
+ * attributes Radix UI sets. Without these, the Switch background
+ * never goes primary on toggle, Tabs/Select/Popover open animations
+ * don't fire, and the thumb doesn't move. */
+@custom-variant data-checked (&[data-state="checked"]);
+@custom-variant data-unchecked (&[data-state="unchecked"]);
+@custom-variant data-open (&[data-state="open"], &[data-state="instant-open"]);
+@custom-variant data-closed (&[data-state="closed"]);
+@custom-variant data-active (&[data-state="active"]);
+@custom-variant data-inactive (&[data-state="inactive"]);
+@custom-variant data-on (&[data-state="on"]);
+@custom-variant data-off (&[data-state="off"]);
+@custom-variant data-visible (&[data-state="visible"]);
+@custom-variant data-hidden (&[data-state="hidden"]);
+@custom-variant data-disabled (&[data-disabled]);
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Palette lifted verbatim from the Tokori desktop app (src/index.css):
+ * light = pure white surface, cool slate ink, restrained violet accent;
+ * dark = deep slate stack. `--success` is extension-specific (the
+ * desktop styles success states ad hoc) but stays in the same hue
+ * family. */
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.16 0.005 250);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.16 0.005 250);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.16 0.005 250);
+
+  --primary: oklch(0.21 0.01 250);
+  --primary-foreground: oklch(0.985 0 0);
+
+  --secondary: oklch(0.97 0.005 250);
+  --secondary-foreground: oklch(0.21 0.01 250);
+
+  --muted: oklch(0.97 0.005 250);
+  --muted-foreground: oklch(0.51 0.01 250);
+
+  --accent: oklch(0.965 0.006 250);
+  --accent-foreground: oklch(0.21 0.01 250);
+
+  --destructive: oklch(0.585 0.225 27);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  --success: oklch(0.55 0.13 152);
+  --success-foreground: oklch(0.985 0 0);
+
+  --brand: oklch(0.55 0.2 280); /* electric indigo-violet */
+  --brand-foreground: oklch(0.985 0 0);
+
+  --border: oklch(0.93 0.006 250);
+  --input: oklch(0.93 0.006 250);
+  --ring: oklch(0.62 0.16 280);
+
+  --radius: 0.75rem;
+
+  --sidebar: oklch(0.985 0.003 250);
+  --sidebar-foreground: oklch(0.16 0.005 250);
+  --sidebar-border: oklch(0.93 0.006 250);
+  --sidebar-accent: oklch(0.965 0.006 250);
+  --sidebar-accent-foreground: oklch(0.21 0.01 250);
+}
+
+/* Class-based dark theme, same convention as the desktop: html.dark
+ * wins over the OS preference. `initPageTheme()` (lib/theme.ts)
+ * toggles the class from prefers-color-scheme on every page entry. */
+.dark {
+  --background: oklch(0.13 0.006 250);
+  --foreground: oklch(0.97 0.005 250);
+
+  --card: oklch(0.165 0.007 250);
+  --card-foreground: oklch(0.97 0.005 250);
+
+  --popover: oklch(0.18 0.008 250);
+  --popover-foreground: oklch(0.97 0.005 250);
+
+  --primary: oklch(0.97 0.005 250);
+  --primary-foreground: oklch(0.21 0.01 250);
+
+  --secondary: oklch(0.22 0.008 250);
+  --secondary-foreground: oklch(0.97 0.005 250);
+
+  --muted: oklch(0.22 0.008 250);
+  --muted-foreground: oklch(0.71 0.012 250);
+
+  --accent: oklch(0.24 0.01 250);
+  --accent-foreground: oklch(0.97 0.005 250);
+
+  --destructive: oklch(0.7 0.2 22);
+  --destructive-foreground: oklch(0.97 0.005 250);
+
+  --success: oklch(0.74 0.13 152);
+  --success-foreground: oklch(0.13 0.006 250);
+
+  --brand: oklch(0.7 0.18 280);
+  --brand-foreground: oklch(0.13 0.006 250);
+
+  --border: oklch(1 0 0 / 0.08);
+  --input: oklch(1 0 0 / 0.13);
+  --ring: oklch(0.66 0.17 280);
+
+  --sidebar: oklch(0.115 0.005 250);
+  --sidebar-foreground: oklch(0.97 0.005 250);
+  --sidebar-border: oklch(1 0 0 / 0.08);
+  --sidebar-accent: oklch(0.24 0.01 250);
+  --sidebar-accent-foreground: oklch(0.97 0.005 250);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  :root {
+    color-scheme: light dark;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  html,
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-sans);
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+
+  /* Interactive things read as interactive. Tailwind's preflight leaves
+   * buttons on the UA default (arrow cursor), which makes the popup /
+   * options controls feel inert. Disabled state opts back out. */
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']),
+  [role='switch']:not([data-disabled]),
+  [role='tab'],
+  [role='option'],
+  [role='menuitem'],
+  select,
+  summary,
+  label:has(input[type='checkbox']),
+  label:has(input[type='radio']) {
+    cursor: pointer;
+  }
+
+  /* Thin, light scrollbars everywhere on extension pages (popup,
+   * options, welcome) — standard properties, themed via the palette so
+   * they read correctly in light and dark. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklch, var(--muted-foreground) 35%, transparent) transparent;
+  }
+}

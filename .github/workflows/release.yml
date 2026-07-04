@@ -1,0 +1,44 @@
+# Tag-driven releases: pushing a tag like `v0.2.0` runs the full check
+# gate, builds the extension, zips `dist/`, and publishes a GitHub
+# Release with the zip attached + auto-generated notes. Install story
+# for users who don't build from source: download, unzip, "Load
+# unpacked" — see README → Install.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check (typecheck + lint + format + tests)
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Package
+        run: |
+          cd dist
+          zip -r "../tokori-chrome-extension-${GITHUB_REF_NAME}.zip" .
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tokori-chrome-extension-${{ github.ref_name }}.zip
+          generate_release_notes: true

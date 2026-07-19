@@ -42,6 +42,7 @@ import { CaptionSettingsPanel } from './youtube/CaptionSettingsPanel';
 import { registerMiningSource, type MiningSource } from '../lib/mining/source';
 import type { Settings } from '../lib/settings';
 import { useImmersionTimer } from './youtube/useImmersion';
+import { isShortsPage, ytPageVideoId, ytPlayerEl, ytVideoSelector } from './youtube/player-el';
 import { useOcrCues } from './ocr/useOcrCues';
 import { OcrRegionSelector } from './ocr/OcrRegionSelector';
 import { DEFAULT_OCR_REGION, normalizeOcrRegion, type OcrRegion } from '../lib/ocr-cues';
@@ -101,6 +102,11 @@ export function YouTubeEnhancer() {
   const lastNativeRef = useRef<Cue | null>(null);
   const lastTranslatedRef = useRef<Cue | null>(null);
   const [isYouTube, setIsYouTube] = useState(false);
+  /** Shorts page (`/shorts/<id>`) — the player is `#shorts-player`, a
+   *  narrow portrait box, and there's no `#secondary` column for the
+   *  sidebar to dock into. Tracked as state (updated by the RAF loop)
+   *  so SPA navigation between watch and Shorts re-scopes everything. */
+  const [isShorts, setIsShorts] = useState(false);
   const [offset, setOffset] = useState<DragOffset | null>(null);
   const [targetLang, setTargetLang] = useState<LanguageCode | null>(null);
   const [hovered, setHovered] = useState(false);
@@ -212,12 +218,16 @@ export function YouTubeEnhancer() {
   const [selectingRegion, setSelectingRegion] = useState(false);
   /** OCR-mode drag offset (separate persistence — see the key above). */
   const [ocrOffset, setOcrOffset] = useState<DragOffset | null>(null);
+  /** Active player's <video> — `#shorts-player video` on Shorts. State
+   *  (not a live query) so hooks taking a selector re-arm on SPA
+   *  navigation between the two page types. */
+  const videoSel = isShorts ? '#shorts-player video' : '#movie_player video';
   const ocr = useOcrCues(
     isYouTube && ocrMode,
     targetLang,
     ocrRegion ?? DEFAULT_OCR_REGION,
     enMode !== 'off',
-    '#movie_player video',
+    videoSel,
   );
   const nativeCues = ocrMode ? ocr.native : native;
   // EN off hides the translated stream EVERYWHERE (overlay line, RAF
@@ -487,7 +497,7 @@ export function YouTubeEnhancer() {
     // a navigation). The MAIN world already drops mismatched responses;
     // this guards the listener side of the same race.
     const cuesMatchPage = (videoId: string | undefined) => {
-      const cur = new URLSearchParams(window.location.search).get('v');
+      const cur = ytPageVideoId();
       return !videoId || !cur || videoId === cur;
     };
     const onNative = (e: Event) => {
@@ -611,9 +621,15 @@ export function YouTubeEnhancer() {
   useEffect(() => {
     if (!isYouTube) return;
     const tick = () => {
-      const video = document.querySelector('video');
-      const player = document.getElementById('movie_player') as HTMLElement | null;
+      // Scoped to the active player — Shorts pages keep preloaded
+      // prev/next reel <video>s around, and a bare 'video' query (or
+      // the hidden #movie_player left over from a watch navigation)
+      // would read the wrong element.
+      const video = document.querySelector<HTMLVideoElement>(ytVideoSelector());
+      const player = ytPlayerEl();
       const rectSource = player || video;
+      const shorts = isShortsPage();
+      setIsShorts((prev) => (prev === shorts ? prev : shorts));
       if (rectSource) {
         const rect = rectSource.getBoundingClientRect();
         // Only update state when the rect meaningfully changes — avoids a
@@ -666,7 +682,7 @@ export function YouTubeEnhancer() {
   useEffect(() => {
     if (!isYouTube) return;
     const dereg = registerMiningSource((): MiningSource | null => {
-      const video = document.querySelector<HTMLVideoElement>('video');
+      const video = document.querySelector<HTMLVideoElement>(ytVideoSelector());
       const native = activeNativeRef.current;
       const translated = activeTranslatedRef.current;
       const detected = native?.text ? detectLanguage(native.text) : null;
@@ -784,7 +800,7 @@ export function YouTubeEnhancer() {
     if (!watchUrl || listState === 'busy' || listState === 'in') return;
     setListState('busy');
     setListError(null);
-    const video = document.querySelector<HTMLVideoElement>('#movie_player video');
+    const video = document.querySelector<HTMLVideoElement>(ytVideoSelector());
     sendMsg(
       {
         action: 'sendLibraryItem',
@@ -1425,11 +1441,11 @@ export function YouTubeEnhancer() {
           current={ocrRegion}
           onSelect={saveOcrRegion}
           onCancel={() => setSelectingRegion(false)}
-          videoSelector="#movie_player video"
+          videoSelector={videoSel}
         />
       )}
       <CaptionSidebar
-        open={sidebarOpen}
+        open={sidebarOpen && !isShorts}
         onClose={() => toggleSidebar(false)}
         native={nativeCues}
         translated={translatedCues}
@@ -1479,6 +1495,10 @@ export function YouTubeEnhancer() {
               display: 'flex',
               justifyContent: 'center',
               alignItems: 'center',
+              // The portrait Shorts player is ~360-480px wide — the pill
+              // row must be allowed to wrap instead of spilling past the
+              // video edges.
+              flexWrap: 'wrap',
               gap: '6px',
               marginBottom: '4px',
               // Pinned visible while loading cues on a captioned video
@@ -1815,28 +1835,32 @@ export function YouTubeEnhancer() {
               <span>{immersion.active ? formatTimer(immersion.ms) : 'Immerse'}</span>
             </button>
 
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                toggleSidebar(!sidebarOpen);
-              }}
-              onMouseDown={(e) => e.stopPropagation()}
-              title={
-                sidebarOpen ? 'Hide caption sidebar' : 'Show caption sidebar (full transcript)'
-              }
-              aria-label="Toggle caption sidebar"
-              style={s({
-                background: sidebarOpen ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.7)',
-                color: '#fff',
-                border: '1px solid rgba(255,255,255,0.15)',
-                borderRadius: '999px',
-                padding: '3px 10px',
-                fontSize: '11px',
-                cursor: 'pointer',
-              })}
-            >
-              ☰ CC
-            </button>
+            {/* No sidebar on Shorts — there's no #secondary column to
+                dock into, and a ≤60s loop has no use for a transcript. */}
+            {!isShorts && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleSidebar(!sidebarOpen);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                title={
+                  sidebarOpen ? 'Hide caption sidebar' : 'Show caption sidebar (full transcript)'
+                }
+                aria-label="Toggle caption sidebar"
+                style={s({
+                  background: sidebarOpen ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.7)',
+                  color: '#fff',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '999px',
+                  padding: '3px 10px',
+                  fontSize: '11px',
+                  cursor: 'pointer',
+                })}
+              >
+                ☰ CC
+              </button>
+            )}
 
             <button
               onClick={(e) => {

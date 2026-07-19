@@ -44,6 +44,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { sendMsg } from '../../lib/chromeApi';
 import { accrualEdge } from '../../lib/immersion';
+import { ytVideoEl } from './player-el';
 import type { Settings } from '../../lib/settings';
 
 const BEAT_FLUSH_MS = 10_000;
@@ -194,9 +195,9 @@ export function useImmersionTimer(
       // Wall-clock cadence, independent of accrual — the keepalive must
       // keep the session's heartbeat fresh even while nothing counts.
       sinceFlush += delta;
-      // #movie_player scopes the query to the real watch-page player —
-      // hovering a homepage preview video must not count.
-      const video = document.querySelector<HTMLVideoElement>('#movie_player video');
+      // Scoped to the active player (watch or Shorts) — hovering a
+      // homepage preview video must not count.
+      const video = ytVideoEl();
       const playing = !!video && !video.paused && !video.ended;
       // The state we report to the desktop: "is watch time accruing"
       // (before the desktop-pause gate — that gate is the desktop's
@@ -282,7 +283,7 @@ export function useImmersionTimer(
         // state was already applied by the background; play() may be
         // rejected by autoplay policy in a background tab — the
         // session still resumes, counting whenever playback does.
-        const video = document.querySelector<HTMLVideoElement>('#movie_player video');
+        const video = ytVideoEl();
         if (r.control === 'pause') video?.pause();
         else if (r.control === 'resume' && video?.paused) {
           void video.play().catch(() => {});
@@ -331,7 +332,7 @@ function pageTitle(): string {
  *  Empty when there's no player (channel pages etc.) — the beat then
  *  carries time only. */
 function playbackInfo(): { positionSec?: number; durationSec?: number; ended?: boolean } {
-  const video = document.querySelector<HTMLVideoElement>('#movie_player video');
+  const video = ytVideoEl();
   if (!video) return {};
   return {
     positionSec: Math.round(video.currentTime) || undefined,

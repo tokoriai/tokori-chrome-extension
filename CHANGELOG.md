@@ -95,6 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   desktop dashboard, heatmap, streak, and Activities view include the time;
   a one-shot completed-session log remains the fallback for desktops
   without the live API.
+- YouTube **Shorts** support: the caption pipeline now recognises
+  `/shorts/<id>` pages and the `#shorts-player` element — dual subtitles,
+  readings, word popups, mining, and the Subtitle menu work on Shorts,
+  with the pill row wrapping to the narrow portrait player. Shorts have
+  no player CC button, so the toolbar reveals on hover (same as
+  caption-less videos); the transcript sidebar stays a watch-page
+  feature. Every player lookup is now scoped to the active page type,
+  which also stops preloaded prev/next reels (or a hidden leftover
+  player from a previous navigation) from being read by mistake.
 - Documentation: README rebuilt around real screenshots (`docs/`), plus
   `docs/ARCHITECTURE.md` describing the surfaces, caption pipeline, OCR
   pipeline, and background caches. Builds now ship the tesseract.js

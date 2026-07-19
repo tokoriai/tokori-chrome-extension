@@ -6,6 +6,7 @@ import {
   SIMPLIFIED_CODES,
   type PickableTrack,
 } from '../lib/yt-track-pick';
+import { isShortsPage, ytPageVideoId, ytPlayerEl } from './youtube/player-el';
 
 /**
  * MAIN-world script: capture YouTube's own timedtext fetches so we can
@@ -193,7 +194,8 @@ let handsOffFor = '';
 let selectionGen = 0;
 
 function getVideoId(): string {
-  return (window.location.search.match(/[?&]v=([^&]+)/) || [])[1] || '';
+  // ?v= on watch pages; the path id on /shorts/<id> and /live/<id>.
+  return ytPageVideoId();
 }
 
 function parseEventsJson(data: {
@@ -801,7 +803,7 @@ function selectForTarget(target: string) {
   // run (previous video / language) becomes a no-op.
   const gen = selectionGen;
   try {
-    const player = document.getElementById('movie_player') as unknown as YTPlayer | null;
+    const player = ytPlayerEl() as unknown as YTPlayer | null;
     if (!player?.getOption || !player.setOption) return false;
     const tracklist = readTracklist(player);
     if (!tracklist.length) {
@@ -1003,7 +1005,7 @@ function publishTracks() {
   const vid = getVideoId();
   if (!vid || tracksSentFor === vid) return;
   try {
-    const player = document.getElementById('movie_player') as unknown as YTPlayer | null;
+    const player = ytPlayerEl() as unknown as YTPlayer | null;
     if (!player?.getOption) return;
     const tracklist = readTracklist(player);
     if (!tracklist.length) return;
@@ -1076,7 +1078,7 @@ function poll() {
     // this back to 'has' before the grace elapses, so a slow tracklist
     // isn't misjudged. OCR mode is unaffected (it never used this loop).
     if (n >= 3) {
-      const p = document.getElementById('movie_player') as unknown as YTPlayer | null;
+      const p = ytPlayerEl() as unknown as YTPlayer | null;
       if (p && captionAvailability(p) === 'none') {
         captionsUnavailable = true;
         if (selectionRetryTimer) window.clearInterval(selectionRetryTimer);
@@ -1358,13 +1360,19 @@ function pollCcButtonState() {
   // retry loop stops once cues are flowing, but a late-loading
   // tracklist (or a CC-off video) should still populate the subtitle menu.
   publishTracks();
-  // Scope to the main player — hover previews / miniplayers mount their
-  // own `.ytp-subtitles-button`, and a bare querySelector can land on
-  // one of those and report the wrong state.
+  // Scope to the active player — hover previews / miniplayers mount
+  // their own `.ytp-subtitles-button`, and a bare querySelector can
+  // land on one of those and report the wrong state. Shorts pages have
+  // no such button at all (their caption toggle lives outside the
+  // player), so there we fall through to the "no CC control" report
+  // below instead of never dispatching a state.
   const btn =
-    document.querySelector<HTMLButtonElement>('#movie_player .ytp-subtitles-button') ||
-    document.querySelector<HTMLButtonElement>('.ytp-subtitles-button');
-  if (!btn) return;
+    (ytPlayerEl()?.querySelector<HTMLButtonElement>('.ytp-subtitles-button') ??
+      (isShortsPage()
+        ? null
+        : document.querySelector<HTMLButtonElement>('.ytp-subtitles-button'))) ||
+    null;
+  if (!btn && !isShortsPage()) return;
   // New video (or off-watch page): the previous readings belong to
   // another player state — start from a clean baseline so a flip
   // spanning two videos can never register as a transition.
@@ -1379,8 +1387,9 @@ function pollCcButtonState() {
   // hidden (display:none ⇒ zero size), stuck at aria-pressed=false.
   // That is NOT the user dismissing captions — report it as "no CC
   // control" so the overlay stays reachable (it's exactly where the
-  // burned-in-subtitle OCR mode is needed).
-  const absent = btn.offsetWidth === 0 && btn.offsetHeight === 0;
+  // burned-in-subtitle OCR mode is needed). A Shorts page (no button
+  // element at all) reports the same way.
+  const absent = !btn || (btn.offsetWidth === 0 && btn.offsetHeight === 0);
   const enabled = absent ? true : btn.getAttribute('aria-pressed') === 'true';
   if (enabled !== lastCcEnabled || absent !== lastCcAbsent) {
     const wasEnabled = lastCcEnabled;
@@ -1496,7 +1505,7 @@ function pollNativeMenuPick() {
     return;
   }
   try {
-    const player = document.getElementById('movie_player') as unknown as YTPlayer | null;
+    const player = ytPlayerEl() as unknown as YTPlayer | null;
     const cur = player?.getOption?.('captions', 'track') as TrackInfo | undefined;
     const tl = cur?.translationLanguage?.languageCode || '';
     if (!cur || (!cur.vssId && !tl)) return;

@@ -88,14 +88,14 @@ More screenshots in [`docs/`](docs/) — the
 
 ## Where it works
 
-| Site               | What you get                                                              |
-| ------------------ | ------------------------------------------------------------------------- |
-| **YouTube**        | Dual subtitles, track menu, sidebar, analyzer, mining, OCR, immersion ⏱   |
-| **Netflix**        | Dual subtitles harvested from the stream's subtitle tracks                |
-| **Disney+**        | Same treatment as Netflix                                                 |
-| **bilibili.tv**    | OCR dual subtitles (most content there ships burned-in subs)              |
-| **Any web page**   | Hover dictionary, analyzer, save words, send article to the Tokori reader |
-| **Your own files** | Dual-subtitle player page (SRT/VTT, auto-translate, desktop OCR)          |
+| Site               | What you get                                                                                                |
+| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| **YouTube**        | Dual subtitles (watch pages, live streams, Shorts), track menu, sidebar, analyzer, mining, OCR, immersion ⏱ |
+| **Netflix**        | Dual subtitles harvested from the stream's subtitle tracks                                                  |
+| **Disney+**        | Same treatment as Netflix                                                                                   |
+| **bilibili.tv**    | OCR dual subtitles (most content there ships burned-in subs)                                                |
+| **Any web page**   | Hover dictionary, analyzer, save words, send article to the Tokori reader                                   |
+| **Your own files** | Dual-subtitle player page (SRT/VTT, auto-translate, desktop OCR)                                            |
 
 ## Install
 

@@ -801,11 +801,36 @@ function enterHandsOff(player: YTPlayer) {
   announceHandsOff();
 }
 
+/** Confirmed "the CC toggle is OFF" reading: the button exists, is
+ *  visible (a hidden zero-size button means the video has no caption
+ *  tracks — different situation), and is not pressed. Early loads
+ *  where the button isn't in the DOM yet read as NOT off. */
+function ccButtonReadsOff(): boolean {
+  const host = ytPlayerEl();
+  const btn =
+    (host?.querySelector<HTMLButtonElement>('.ytp-subtitles-button') ??
+      (isShortsPage()
+        ? null
+        : document.querySelector<HTMLButtonElement>('.ytp-subtitles-button'))) ||
+    null;
+  if (!btn) return false;
+  if (btn.offsetWidth === 0 && btn.offsetHeight === 0) return false;
+  return btn.getAttribute('aria-pressed') !== 'true';
+}
+
 function selectForTarget(target: string) {
   // Respect an explicit CC-off: selecting a track would turn the
   // player's captions back on against the user's wishes. Same while
   // the overlay's OCR mode has selection suspended.
   if (ccUserOff || selectionSuspended) return false;
+  // YouTube's CC toggle is the master switch for AUTOMATIC captions.
+  // With the button visibly off — the sticky preference, not just a
+  // fresh dismissal — auto mode must not steer at all: setOption
+  // re-enables the player's captions, which is how the overlay ended
+  // up on every video ("CC always visible even though CC is off").
+  // Explicit Subtitle-menu picks and OCR stay opt-ins regardless, and
+  // pressing CC on starts a round via the state mirror.
+  if (nativeOverride.mode === 'auto' && ccButtonReadsOff()) return false;
   // Never select against the placeholder 'en' target — wait for the
   // content script to report the real one (see targetSettled's grace).
   if (!targetSettled()) return false;

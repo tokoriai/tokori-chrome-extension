@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins itself for a few seconds ("Subtitle: Auto (no Chinese CC)" + the
   "No Chinese CC" pill) before falling back to hover-reveal, instead of
   being indistinguishable from not running.
+- YouTube's CC toggle is now the master switch for AUTOMATIC captions:
+  with the button visibly off, auto mode no longer steers at all — the
+  act of selecting a track re-enables the player's captions, which
+  (combined with the restored auto-translate) had put the overlay on
+  every video regardless of the CC state. CC on → Tokori dual
+  subtitles; CC off → nothing, quietly. Explicit Subtitle-menu picks
+  and OCR remain opt-ins that work regardless of the toggle.
 
 ### Fixed
 

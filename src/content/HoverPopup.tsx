@@ -90,6 +90,10 @@ export function HoverPopup() {
 
   // ── AI-generated definition (dictionary misses) ────────────────
   const [genEntry, setGenEntry] = useState<DictEntry | null>(null);
+  /** False when the generated entry could not be written to the
+   *  personal dictionary — the definition shows, but it won't stick
+   *  for the next lookup, and the user should know that. */
+  const [genPersisted, setGenPersisted] = useState(true);
   const [genExamples, setGenExamples] = useState<Array<{ target: string; native?: string }>>([]);
   const [genBusy, setGenBusy] = useState(false);
   const [genErr, setGenErr] = useState<string | null>(null);
@@ -313,13 +317,24 @@ export function HoverPopup() {
     const res = await sendMsgAsync<{
       entry: DictEntry;
       examples?: Array<{ target: string; native?: string }>;
+      persisted?: boolean;
     }>({ action: 'aiDefine', word: state.query, lang: state.lang });
     setGenBusy(false);
     if (res.success) {
-      const r = res as { entry?: DictEntry; examples?: Array<{ target: string; native?: string }> };
+      const r = res as {
+        entry?: DictEntry;
+        examples?: Array<{ target: string; native?: string }>;
+        persisted?: boolean;
+      };
       if (r.entry) {
         setGenEntry(r.entry);
         setGenExamples(r.examples || []);
+        // The generated entry replaces the lookup miss — clearing the
+        // error, or "No entry for …" keeps rendering above the fresh
+        // definition (and reads as "generating did nothing").
+        setError(null);
+        setErrorCode(null);
+        setGenPersisted(r.persisted !== false);
       }
     } else {
       setGenErr((res as { error: string }).error);
@@ -588,6 +603,11 @@ export function HoverPopup() {
         {genEntry && (
           <div>
             <DefinitionList definitions={genEntry.definitions} />
+            {!genPersisted && (
+              <div style={s({ color: TOKENS.warn, fontSize: '11px', marginTop: '4px' })}>
+                Couldn't save this to your personal dictionary — it won't stick for the next lookup.
+              </div>
+            )}
             {genExamples.length > 0 && (
               <div
                 style={s({

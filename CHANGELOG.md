@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The English-line hunt no longer wastes excursions translating a track
   into its own language, and an auto-generated display-language track
   now serves the line directly on videos that have no human one.
+- Generating a definition in the word popup now clears the "No entry
+  for …" error it answers — the message used to keep rendering above
+  the fresh definition, as if generating had done nothing. If saving
+  the generated entry to the personal dictionary fails, the popup now
+  says so instead of failing silently (the save is what makes the next
+  lookup of that word hit).
 
 ## [0.2.0] - 2026-07-19
 

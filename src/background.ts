@@ -2455,12 +2455,14 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
           reading: def.reading || undefined,
           definitions: definitions.length ? definitions : [def.gloss],
         };
+        let persisted = true;
         try {
           await upsertPersonalEntry(lang, entry);
         } catch (e) {
+          persisted = false;
           warn('saving generated entry to personal dict failed:', e);
         }
-        sendResponse({ success: true, entry, examples: def.examples, source });
+        sendResponse({ success: true, entry, examples: def.examples, source, persisted });
       } catch (e) {
         sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
       }

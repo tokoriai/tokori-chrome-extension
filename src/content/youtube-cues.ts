@@ -825,20 +825,24 @@ function selectForTarget(target: string) {
     }
 
     // Resting-source decision — target-language track first, the zh
-    // Hant→Hans translation for a Traditional-only video, else NOTHING
-    // (hands-off below — auto never translates other languages into
-    // the target). The ladder lives in lib/yt-track-pick (pure,
-    // unit-tested); the Hant→Hans rung is auto-mode only — a pinned
-    // track is verbatim — and drops out once `restingFellBack` marks
-    // it cue-less (Traditional captions beat no captions).
+    // Hant→Hans translation for a Traditional-only video, then the
+    // base track auto-translated into the target (YouTube's own
+    // translation — the "study any video" default), else hands-off.
+    // The ladder lives in lib/yt-track-pick (pure, unit-tested); the
+    // translation rungs are auto-mode only — a pinned track is
+    // verbatim — and drop out once `restingFellBack` marks them
+    // cue-less (for Hant→Hans, Traditional captions beat no captions;
+    // for the general fallback the next round enters hands-off).
     const ov = nativeOverride;
     const plan = planRestingPick(tracklist, target, {
       resolveTlang: (l) => resolveTranslateCode(player, l),
-      // The Hant→Hans rung also needs the player to actually OFFER a
-      // Simplified translation — resting on an unlisted one shows no
-      // cues for 6s until the timed fallback drops to plain
-      // Traditional; skipping the rung gets there immediately.
+      // The translation rungs also need the player to actually OFFER
+      // the target — resting on an unlisted translation shows no cues
+      // for 6s until the timed fallback fires; skipping the rung gets
+      // to the fallback immediately.
       allowHantToHans: ov.mode === 'auto' && !restingFellBack && translationOffered(player, 'zh'),
+      autoTranslateFallback:
+        ov.mode === 'auto' && !restingFellBack && translationOffered(player, target),
     });
     const prefixMatch = plan.targetTrack;
     const base = plan.baseTrack;
@@ -895,6 +899,21 @@ function selectForTarget(target: string) {
       }
       if (!overrideResting) publishAutoPick(restingTrack);
       return true;
+    }
+
+    // The general auto-translate resting (no target-language track)
+    // never produced cues — some tracks refuse translation despite
+    // advertising it. Mark it failed; the next tick re-plans with the
+    // fallback rung disabled and enters hands-off (announced to the
+    // overlay), leaving YouTube's own captions alone.
+    if (
+      !nativeCuesSent &&
+      !overrideResting &&
+      plan.translatedFallback &&
+      Date.now() - restingSetAt > 6000
+    ) {
+      restingFellBack = true;
+      return false;
     }
 
     // Hant→Hans resting didn't produce native cues in time (some tracks

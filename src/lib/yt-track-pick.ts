@@ -10,23 +10,30 @@
  *      own Hant→Hans translation of that track (until the caller finds
  *      it cue-less and re-plans with `allowHantToHans: false`, which
  *      makes rung 1 win verbatim);
- *   3. no target-language track at all: resting is NULL — the caller
- *      stays HANDS-OFF and leaves YouTube's own captions alone.
+ *   3. no target-language track: YouTube's own auto-translation of the
+ *      base track into the target (`autoTranslateFallback`, caller-gated
+ *      on the player actually OFFERING that translation), so any video
+ *      still studies in the target language by default;
+ *   4. translation not offered / no translatable base / the fallback
+ *      already proved cue-less: resting is NULL — the caller stays
+ *      HANDS-OFF and leaves YouTube's own captions alone.
  *
- * Rung 3 used to auto-translate a base track into the target
- * (workspace) language, and it produced exactly the breakage it was
- * meant to prevent: a "… → undefined" entry in YouTube's CC menu, no
- * cues at all on untranslatable tracks, and YouTube's own renderer
- * piling the whole machine-translated transcript on screen at once.
- * A video that isn't in the workspace language now gets NO automatic
- * takeover — translation into the target is something the user asks
- * for explicitly (a subtitle-menu tlang pin), never the default.
+ * Rung 3's first life produced real breakage — a "… → undefined" entry
+ * in YouTube's CC menu, no cues at all on untranslatable tracks, and
+ * YouTube's own renderer piling the whole machine-translated transcript
+ * on screen at once — which is why it was removed for a while. It is
+ * safe now because the caller routes every translation through
+ * `makeTranslationTrack` (a VERBATIM `translationLanguages` entry,
+ * languageName included), gates on `translationOffered`, hides the
+ * native rendering of active translations, and drops a cue-less
+ * fallback to hands-off on a timer.
  *
- * `baseTrack` is still computed as the SOURCE for those explicit
- * translate pins (and for the display-language line's excursions): an
- * English track that is actually translatable first, then ANY
- * translatable track, then English/first as a last resort — a
- * non-translatable base would silently yield no cues.
+ * `baseTrack` doubles as the SOURCE for rung 3, explicit translate
+ * pins, and the display-language line's excursions: an English track
+ * that is actually translatable first, then ANY translatable track,
+ * then English/first as a last resort — a non-translatable base would
+ * silently yield no cues (rung 3 additionally requires translatability
+ * outright).
  */
 
 export interface PickableTrack {
@@ -69,12 +76,16 @@ export interface RestingPlan<T> {
    *  display-language excursions (en translatable > any translatable >
    *  en > first). Never drives the automatic resting pick. */
   baseTrack: T | null;
-  /** What the native caption line should rest on. Null ⇒ the video has
-   *  no target-language track (or no tracks at all): stay hands-off. */
+  /** What the native caption line should rest on. Null ⇒ nothing to
+   *  rest on (no target track and no usable translation): hands-off. */
   resting: RestingPick<T> | null;
   /** The resting pick is the zh Hant→Hans translation — the caller's
    *  timed "translation produced no cues" fallback keys on this. */
   hantToHans: boolean;
+  /** The resting pick is rung 3 (base track auto-translated into the
+   *  target) — the caller's timed cue-less fallback keys on this to
+   *  drop to hands-off. */
+  translatedFallback: boolean;
 }
 
 export function planRestingPick<T extends PickableTrack>(
@@ -87,6 +98,11 @@ export function planRestingPick<T extends PickableTrack>(
     /** False once the Hant→Hans translation proved cue-less (or a user
      *  pin is in charge) — rung 2 is skipped. Defaults to true. */
     allowHantToHans?: boolean;
+    /** Rung 3: with no target-language track, rest on the base track's
+     *  auto-translation into the target. The caller passes true only
+     *  when the player offers that translation and no earlier round
+     *  proved it cue-less. Defaults to false (hands-off). */
+    autoTranslateFallback?: boolean;
   },
 ): RestingPlan<T> {
   const tgt = target.toLowerCase();
@@ -112,11 +128,23 @@ export function planRestingPick<T extends PickableTrack>(
     !!targetTrack &&
     TRADITIONAL_CODES.includes(lower(targetTrack));
 
+  // Rung 3 — only without a target track, only onto a base that is
+  // genuinely translatable, and only when the resolver produces a
+  // translate code (the caller additionally gates on the player's
+  // offered-translations list).
+  const fallbackTlang =
+    !targetTrack && (opts.autoTranslateFallback ?? false) && baseTrack && translatable(baseTrack)
+      ? opts.resolveTlang(tgt)
+      : '';
+  const translatedFallback = !!fallbackTlang;
+
   const resting: RestingPick<T> | null = targetTrack
     ? hantToHans
       ? { mode: 'translate', source: targetTrack, tlang: opts.resolveTlang('zh') }
       : { mode: 'track', track: targetTrack }
-    : null;
+    : translatedFallback
+      ? { mode: 'translate', source: baseTrack!, tlang: fallbackTlang }
+      : null;
 
-  return { targetTrack, baseTrack, resting, hantToHans };
+  return { targetTrack, baseTrack, resting, hantToHans, translatedFallback };
 }

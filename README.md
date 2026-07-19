@@ -34,8 +34,9 @@ with per-character **pinyin / furigana ruby** in tone colours — and a
 translation line underneath (show, blur-until-click, or off). A **Subtitle
 menu** offers the same choices as YouTube's own CC menu (the automatic pick
 for your language, any real caption track, any auto-translate language, or
-Off), follows picks made in YouTube's native menu, and stands down cleanly on
-videos that have no captions in your language.
+Off) and follows picks made in YouTube's native menu. Videos with no captions
+in your language rest on YouTube's own auto-translation of them; when that
+isn't available either, the extension stands down cleanly and says so.
 
 - **Netflix & Disney+ too.** The extension reads the stream's own subtitle
   tracks (WebVTT), so both lines work regardless of — and without — the

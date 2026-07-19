@@ -9,15 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Videos with no caption track in your target language now announce the
-  hands-off verdict: the caption toolbar pins itself for a few seconds
-  ("Subtitle: Auto (no Chinese CC)" + the "No Chinese CC" pill) before
-  falling back to hover-reveal. Previously the only trace was a
-  hover-revealed bar, which read as "the extension stopped working" on
-  every out-of-language video — the extension deliberately leaves
-  YouTube's own captions alone there, with the Subtitle menu offering
-  the explicit ways in (an Auto-translate language, a caption track
-  as-is, or OCR).
+- Auto mode translates again: videos with no caption track in your
+  target language rest on YouTube's own auto-translation of the base
+  track (the pre-0.2.0 "study any video" default), now through the safe
+  mechanics that 0.2.0 built — verbatim translation entries (no
+  "… → undefined" menu items), an offered-translations gate, hiding of
+  YouTube's own rendering of active translations, and a timed drop to
+  hands-off when a track refuses translation. Hands-off is now the
+  exception (translation not offered, nothing translatable, or the
+  translation proved cue-less) rather than the rule.
+- When the extension does stand down, it says so: the caption toolbar
+  pins itself for a few seconds ("Subtitle: Auto (no Chinese CC)" + the
+  "No Chinese CC" pill) before falling back to hover-reveal, instead of
+  being indistinguishable from not running.
 
 ## [0.2.0] - 2026-07-19
 

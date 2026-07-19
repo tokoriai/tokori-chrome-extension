@@ -69,6 +69,39 @@ describe('planRestingPick', () => {
     expect(plan.baseTrack).toBe(list[0]);
   });
 
+  it('rests on the base track auto-translated into the target with the fallback rung', () => {
+    const list = [track('en'), track('ko')];
+    const plan = planRestingPick(list, 'zh', { resolveTlang, autoTranslateFallback: true });
+    expect(plan.targetTrack).toBeNull();
+    expect(plan.resting).toEqual({ mode: 'translate', source: list[0], tlang: 'zh-Hans' });
+    expect(plan.translatedFallback).toBe(true);
+    expect(plan.hantToHans).toBe(false);
+  });
+
+  it('never uses the fallback rung when a target-language track exists', () => {
+    const list = [track('en'), track('ja')];
+    const plan = planRestingPick(list, 'ja', { resolveTlang, autoTranslateFallback: true });
+    expect(plan.resting).toEqual({ mode: 'track', track: list[1] });
+    expect(plan.translatedFallback).toBe(false);
+  });
+
+  it('skips the fallback rung when the resolver offers no translate code', () => {
+    const list = [track('en')];
+    const plan = planRestingPick(list, 'zh', {
+      resolveTlang: () => '',
+      autoTranslateFallback: true,
+    });
+    expect(plan.resting).toBeNull();
+    expect(plan.translatedFallback).toBe(false);
+  });
+
+  it('skips the fallback rung when no base track is translatable', () => {
+    const list = [track('en', { isTranslatable: false }), track('ko', { isTranslatable: false })];
+    const plan = planRestingPick(list, 'zh', { resolveTlang, autoTranslateFallback: true });
+    expect(plan.resting).toBeNull();
+    expect(plan.translatedFallback).toBe(false);
+  });
+
   it('prefers a translatable base over a non-translatable English one for pins', () => {
     const list = [track('en', { isTranslatable: false }), track('ko')];
     const plan = planRestingPick(list, 'zh', { resolveTlang });

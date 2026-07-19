@@ -202,6 +202,137 @@ export async function chatOnce(input: {
   return { text, model };
 }
 
+// ── Vision (image → text) ─────────────────────────────────────────
+//
+// One-shot image+prompt completion, used by the burned-in-subtitle
+// OCR. Same BYO-key rules as `chatOnce`; the default models above are
+// all vision-capable.
+
+function splitDataUrl(dataUrl: string): { mediaType: string; base64: string } {
+  const m = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!m) throw new Error('Expected a base64 data: URL.');
+  return { mediaType: m[1]!, base64: m[2]! };
+}
+
+export async function visionOnce(input: {
+  provider: AiProvider;
+  apiKey: string | null;
+  model?: string;
+  system: string;
+  user: string;
+  imageDataUrl: string;
+}): Promise<{ text: string; model: string }> {
+  if (input.provider === 'none') {
+    throw new AiProviderError('No AI provider configured.', 'none');
+  }
+  if (!input.apiKey) {
+    throw new AiProviderError('No API key set for the selected provider.', input.provider);
+  }
+  const model = input.model?.trim() || DEFAULT_AI_MODELS[input.provider];
+  const { mediaType, base64 } = splitDataUrl(input.imageDataUrl);
+
+  if (input.provider === 'openai') {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${input.apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: input.system },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: input.user },
+              { type: 'image_url', image_url: { url: input.imageDataUrl, detail: 'low' } },
+            ],
+          },
+        ],
+        temperature: 0,
+        max_tokens: 300,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const data = await parseOrThrow<{ choices?: { message?: { content?: string } }[] }>(
+      res,
+      'openai',
+    );
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (text == null)
+      throw new AiProviderError('OpenAI returned an empty response.', 'openai', res.status);
+    return { text, model };
+  }
+
+  if (input.provider === 'anthropic') {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': input.apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 300,
+        system: input.system,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+              { type: 'text', text: input.user },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const data = await parseOrThrow<{ content?: { type: string; text?: string }[] }>(
+      res,
+      'anthropic',
+    );
+    const text = data.content
+      ?.map((b) => (b.type === 'text' ? (b.text ?? '') : ''))
+      .join('')
+      .trim();
+    if (text == null)
+      throw new AiProviderError('Anthropic returned an empty response.', 'anthropic', res.status);
+    return { text, model };
+  }
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
+    `:generateContent?key=${encodeURIComponent(input.apiKey)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: input.system }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ inlineData: { mimeType: mediaType, data: base64 } }, { text: input.user }],
+        },
+      ],
+      generationConfig: { temperature: 0, maxOutputTokens: 300 },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const data = await parseOrThrow<{
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  }>(res, 'gemini');
+  const text = data.candidates?.[0]?.content?.parts
+    ?.map((p) => p.text ?? '')
+    .join('')
+    .trim();
+  if (text == null)
+    throw new AiProviderError('Gemini returned an empty response.', 'gemini', res.status);
+  return { text, model };
+}
+
 /** Explain a sentence using the user's own provider key. Throws
  *  `AiProviderError` on misconfiguration or a provider failure. */
 export async function explain(input: ExplainInput): Promise<ExplainResult> {

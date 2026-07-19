@@ -199,7 +199,7 @@ function Sidebar({
         })}
       </nav>
       <div className="border-t px-5 py-3 text-[11px] text-muted-foreground">
-        v0.1.0 · local-first
+        v{chrome.runtime.getManifest().version} · local-first
       </div>
     </aside>
   );

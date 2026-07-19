@@ -6,6 +6,12 @@ describe('stripDataUrl', () => {
     expect(stripDataUrl('data:image/jpeg;base64,AAAA')).toBe('AAAA');
   });
 
+  it('survives MIME codec params whose comma precedes the payload', () => {
+    // MediaRecorder clips: the naive first-comma cut shipped
+    // "opus;base64,GkXf…" and the desktop rejected the audio_data.
+    expect(stripDataUrl('data:video/webm;codecs=vp9,opus;base64,GkXf')).toBe('GkXf');
+  });
+
   it('returns the input unchanged when there is no comma', () => {
     expect(stripDataUrl('AAAA')).toBe('AAAA');
   });

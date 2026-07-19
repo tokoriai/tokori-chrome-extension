@@ -92,6 +92,33 @@ function useDockHost(open: boolean): HTMLElement | null {
   return host;
 }
 
+/** Host for the theater drawer: an absolutely-positioned div appended
+ *  to document.body so the panel lives in the PAGE's coordinate space —
+ *  it scrolls away with the player (live-chat feel) and passes under
+ *  YouTube's fixed masthead instead of floating above everything the
+ *  way our max-z-index shadow root does. */
+function useDrawerHost(active: boolean): HTMLElement | null {
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!active) {
+      setHost(null);
+      return;
+    }
+    const node = document.createElement('div');
+    node.id = 'tokori-caption-drawer';
+    // Same reasoning as the dock host: the portal target lives outside
+    // our shadow root, so the theme variables must be set inline here.
+    node.style.cssText = TK_DARK_VARS;
+    document.body.appendChild(node);
+    setHost(node);
+    return () => {
+      node.remove();
+      setHost(null);
+    };
+  }, [active]);
+  return host;
+}
+
 /** Pair each native cue with the translated cue that starts closest to
  *  it (within a tolerance) — the two tracks come from the same
  *  timedtext timeline so starts line up almost exactly. */
@@ -199,10 +226,13 @@ export function CaptionSidebar({
     setRevealed(new Set());
   };
   // Layouts: default view docks into #secondary; theater squeezes the
-  // player and sits beside it (live-chat style); fullscreen lays the
-  // panel over the video's right edge — asbplayer-style.
-  const layout = fullscreen || theater ? 'drawer' : 'dock';
+  // player and sits beside it in the page flow (live-chat style);
+  // fullscreen lays the panel over the video's right edge —
+  // asbplayer-style (there's no page scroll in fullscreen, so a fixed
+  // overlay is correct there).
+  const layout = fullscreen ? 'overlay' : theater ? 'drawer' : 'dock';
   const dockHost = useDockHost(open && layout === 'dock');
+  const drawerHost = useDrawerHost(open && layout === 'drawer');
 
   // Theater "beside" mode: shrink YouTube's full-bleed player container
   // so the panel gets a real gutter instead of covering the video —
@@ -266,34 +296,38 @@ export function CaptionSidebar({
   };
 
   const docked = layout === 'dock' && !!dockHost;
-  // Drawer geometry. Two flavours:
-  //   • Theater with the gap applied → the player has been narrowed, so
-  //     pin the panel in the freed right gutter, flush with the
-  //     player's vertical extent (live-chat look).
-  //   • Fullscreen (or theater where #full-bleed-container wasn't
-  //     found) → overlay the player's right edge, asbplayer-style. In
-  //     fullscreen the player rect IS the viewport.
-  // Both clamp to the viewport so a scrolled page doesn't push the
-  // panel off-screen.
+  // Drawer geometry (theater): absolute in DOCUMENT coordinates inside
+  // the body-portal host, glued to the player's vertical extent — so
+  // scrolling down to the comments carries the panel away with the
+  // player instead of leaving it pinned on top of them.
+  //   • besideGap → the player container has been narrowed; sit in the
+  //     freed right gutter (live-chat look).
+  //   • no gap (#full-bleed-container not found) → overlay the
+  //     player's right edge, asbplayer-style.
   let drawerPos: { left: number; top: number; height: number } | null = null;
   if (layout === 'drawer' && playerRect) {
-    if (besideGap) {
-      const top = Math.max(playerRect.top, 8);
-      const bottom = Math.min(playerRect.bottom, window.innerHeight - 8);
-      drawerPos = {
-        left: window.innerWidth - THEATER_PANEL_PX - 8,
-        top,
-        height: Math.max(160, bottom - top),
-      };
-    } else {
-      const top = Math.max(playerRect.top + 12, 8);
-      const bottom = Math.min(playerRect.bottom - 12, window.innerHeight - 8);
-      drawerPos = {
-        left: playerRect.right - THEATER_PANEL_PX - 12,
-        top,
-        height: Math.max(160, bottom - top),
-      };
-    }
+    const inset = besideGap ? 0 : 12;
+    drawerPos = {
+      left:
+        window.scrollX +
+        (besideGap
+          ? window.innerWidth - THEATER_PANEL_PX - 8
+          : playerRect.right - THEATER_PANEL_PX - 12),
+      top: window.scrollY + playerRect.top + inset,
+      height: Math.max(160, playerRect.height - inset * 2),
+    };
+  }
+  // Fullscreen overlay geometry: viewport-fixed against the player
+  // rect (which IS the viewport in fullscreen — no page scroll there).
+  let overlayPos: { left: number; top: number; height: number } | null = null;
+  if (layout === 'overlay' && playerRect) {
+    const top = Math.max(playerRect.top + 12, 8);
+    const bottom = Math.min(playerRect.bottom - 12, window.innerHeight - 8);
+    overlayPos = {
+      left: playerRect.right - THEATER_PANEL_PX - 12,
+      top,
+      height: Math.max(160, bottom - top),
+    };
   }
   const panel = (
     <div
@@ -313,21 +347,33 @@ export function CaptionSidebar({
             }
           : drawerPos
             ? {
-                position: 'fixed',
+                position: 'absolute',
                 left: `${drawerPos.left}px`,
                 top: `${drawerPos.top}px`,
                 height: `${drawerPos.height}px`,
                 width: `${THEATER_PANEL_PX}px`,
-                zIndex: '2147483644',
+                // Above the page content but BELOW YouTube's fixed
+                // masthead (z≈2020) — scrolling slides the panel under
+                // it, the same way the native live chat behaves.
+                zIndex: '999',
               }
-            : {
-                position: 'fixed',
-                top: '64px',
-                right: '12px',
-                bottom: '12px',
-                width: '340px',
-                zIndex: '2147483644',
-              }),
+            : overlayPos
+              ? {
+                  position: 'fixed',
+                  left: `${overlayPos.left}px`,
+                  top: `${overlayPos.top}px`,
+                  height: `${overlayPos.height}px`,
+                  width: `${THEATER_PANEL_PX}px`,
+                  zIndex: '2147483644',
+                }
+              : {
+                  position: 'fixed',
+                  top: '64px',
+                  right: '12px',
+                  bottom: '12px',
+                  width: '340px',
+                  zIndex: '2147483644',
+                }),
         display: 'flex',
         flexDirection: 'column',
         background: 'rgba(15,17,21,0.97)',
@@ -491,7 +537,13 @@ export function CaptionSidebar({
     </div>
   );
 
-  return dockHost ? createPortal(panel, dockHost) : panel;
+  if (layout === 'dock' && dockHost) return createPortal(panel, dockHost);
+  // Theater drawer renders into the body host in page coordinates;
+  // until the host / player rect exist there's nothing to anchor to.
+  if (layout === 'drawer') {
+    return drawerHost && drawerPos ? createPortal(panel, drawerHost) : null;
+  }
+  return panel;
 }
 
 function CueRow({

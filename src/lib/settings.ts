@@ -141,6 +141,33 @@ export interface Settings {
    *  Netflix) miner captures by default, and how the studied word is
    *  marked inside the saved sentence. */
   mining: MiningConfig;
+  /** Immersion-time tracking (study mode) configuration. */
+  immersion: ImmersionConfig;
+  /** Engine for the burned-in-subtitle OCR (YouTube):
+   *   • 'auto'  — local model when downloaded for the language, else
+   *               the BYO AI key (default).
+   *   • 'local' — downloaded tesseract model only (fully offline
+   *               after the one-time language download).
+   *   • 'ai'    — BYO AI vision key only. */
+  ocrEngine: 'auto' | 'local' | 'ai';
+  /** Tesseract language packs the user downloaded via Options (their
+   *  tesseract ids, e.g. 'chi_sim'). The packs themselves live in the
+   *  offscreen document's IndexedDB cache. */
+  ocrLocalLangs: string[];
+}
+
+export interface ImmersionConfig {
+  /** Keep the immersion timer accruing while the video is paused.
+   *  Default false — pausing the video pauses the timer, so only real
+   *  watch time counts. Turn on for e.g. pause-and-shadow routines
+   *  where thinking time should still count as study time. */
+  countWhilePaused: boolean;
+  /** Auto-start the immersion timer when the playing video is on the
+   *  watch library. Default true — adding a video to the list is the
+   *  opt-in; the timer (and with it, watch-progress tracking) then
+   *  takes care of itself. Stopping the timer manually suppresses the
+   *  auto-start for that video until you navigate away. */
+  autoStartListed: boolean;
 }
 
 export interface MiningConfig {
@@ -214,6 +241,12 @@ export const DEFAULT_SETTINGS: Settings = {
     defaultCardShape: 'vocab',
     clozeMarker: 'cloze',
   },
+  immersion: {
+    countWhilePaused: false,
+    autoStartListed: true,
+  },
+  ocrEngine: 'auto',
+  ocrLocalLangs: [],
 };
 
 export async function getTabOverride(tabId: number): Promise<TabOverride | null> {
@@ -271,6 +304,7 @@ export async function getSettings(): Promise<Settings> {
     anki: { ...DEFAULT_SETTINGS.anki, ...(stored.anki || {}) },
     mining: { ...DEFAULT_SETTINGS.mining, ...(stored.mining || {}) },
     ai: { ...DEFAULT_SETTINGS.ai, ...(stored.ai || {}) },
+    immersion: { ...DEFAULT_SETTINGS.immersion, ...(stored.immersion || {}) },
   };
 }
 

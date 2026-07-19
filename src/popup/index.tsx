@@ -16,10 +16,12 @@ import {
   Cloud,
   Monitor,
   Layers,
+  ListVideo,
   Settings as SettingsIcon,
   LogIn,
   Sparkles,
   Compass,
+  ChartColumn,
 } from 'lucide-react';
 
 import { sendMsgAsync } from '../lib/chromeApi';
@@ -250,6 +252,22 @@ function Popup() {
       <div className="flex items-center justify-between gap-2">
         <Button onClick={() => chrome.runtime.openOptionsPage()} size="sm" className="flex-1">
           <SettingsIcon data-icon="inline-start" /> Settings
+        </Button>
+        <Button
+          onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL('library.html') })}
+          variant="ghost"
+          size="sm"
+          title="Your watch library — queued videos with progress"
+        >
+          <ListVideo data-icon="inline-start" /> Library
+        </Button>
+        <Button
+          onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL('stats.html') })}
+          variant="ghost"
+          size="sm"
+          title="Immersion time statistics"
+        >
+          <ChartColumn data-icon="inline-start" /> Stats
         </Button>
         <Button
           onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL('welcome.html') })}

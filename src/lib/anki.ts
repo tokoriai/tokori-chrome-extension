@@ -103,8 +103,15 @@ export async function storeMediaFile(filename: string, dataUrl: string): Promise
 }
 
 /** Strip the leading `data:…;base64,` from a data URL. Returns the raw
- *  base64 payload AnkiConnect expects. */
+ *  base64 payload AnkiConnect (and the Tokori desktop's `audio_data`)
+ *  expect. Cuts at the `;base64,` marker, NOT the first comma:
+ *  MediaRecorder MIMEs carry codec params ("video/webm;codecs=vp9,opus")
+ *  whose comma sits before the payload — first-comma parsing shipped
+ *  "opus;base64,…" as the data ("audio_data is not valid base64"). */
 export function stripDataUrl(dataUrl: string): string {
+  const marker = ';base64,';
+  const at = dataUrl.indexOf(marker);
+  if (at >= 0) return dataUrl.slice(at + marker.length);
   const ix = dataUrl.indexOf(',');
   return ix >= 0 ? dataUrl.slice(ix + 1) : dataUrl;
 }

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Tokori OCR host</title>
+  </head>
+  <body>
+    <!-- Invisible chrome.offscreen document: hosts the tesseract.js
+         WebAssembly worker for local burned-in-subtitle OCR (MV3
+         service workers cannot spawn Web Workers). -->
+    <script type="module" src="/src/offscreen/index.ts"></script>
+  </body>
+</html>

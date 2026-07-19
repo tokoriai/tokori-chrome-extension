@@ -11,12 +11,18 @@
  *   GET  /v1/workspaces/:id/vocab
  *   POST /v1/workspaces/:id/vocab
  *   GET  /v1/dict/search
+ *   GET/POST /v1/workspaces/:id/media + /v1/media/{lookup,progress}
+ *     (Immersion watch list — desktop ≥ 2026-07; older builds 404 and
+ *     callers degrade gracefully)
+ *   GET  /v1/sessions/:id/control
+ *     (desktop-issued pause/resume/end for the live session — the
+ *     desktop sidebar's remote control; older builds 404 and the
+ *     background stops polling)
  *
- * Library / reader-doc create are NOT exposed by the local API yet —
- * the cloud has them, the desktop doesn't. The extension's
- * "Import to Tokori desktop" actions check this and surface a clear
- * "needs Tokori v0.X.Y, or use Cloud target" message when the
- * endpoint is missing.
+ * Reader-doc create is NOT exposed by the local API yet — the cloud
+ * has it, the desktop doesn't. The extension's "Import to Tokori
+ * desktop" actions check this and surface a clear "needs Tokori
+ * v0.X.Y, or use Cloud target" message when the endpoint is missing.
  */
 
 import { diacriticPinyin } from './dictionaries/cedict';
@@ -106,8 +112,11 @@ export interface VocabRow {
 
 /** List vocab entries for a workspace. Used by the content script to
  *  highlight already-known words inside captions / pages. The desktop
- *  caps `limit` at 500 server-side, so very large vocab sets will be
- *  capped to the most-recent 500 by default. */
+ *  caps `limit` at 500 server-side and ignores `offset`, so a very
+ *  large vocab set returns only the most-recent 500 rows. To cover a
+ *  >500-word workspace, fetch per `status` (the filter is applied
+ *  before the cap) and merge — see `refreshKnownWords` in
+ *  background.ts. */
 export async function listVocab(
   baseUrl: string,
   token: string,
@@ -162,11 +171,6 @@ export interface CreateVocabInput {
    *  can serve it back. */
   audio_data?: string;
   audio_mime?: string;
-  /** Captured short A/V clip as a base64 data URL. The desktop will
-   *  decode + persist as a BLOB to avoid storage bloat. Requires the
-   *  V7 desktop schema. */
-  clip_data?: string;
-  clip_mime?: string;
 }
 
 export async function createVocab(
@@ -181,6 +185,248 @@ export async function createVocab(
     body: JSON.stringify(body),
   });
   return expect<{ id: number }>(res);
+}
+
+/** Log a completed study session into the desktop's `study_sessions`
+ *  table (`POST /v1/workspaces/:id/sessions`, desktop ≥ 2026-07). The
+ *  Companion's tracked immersion time lands in the desktop's dashboard
+ *  KPIs / heatmap / streak through this. `when` is the session END in
+ *  epoch seconds; the desktop back-derives the start. Older desktop
+ *  builds 404 here — callers keep the entry unsynced and retry later. */
+export async function logSession(
+  baseUrl: string,
+  token: string,
+  input: {
+    workspaceId: number;
+    /** Defaults to 'immersion' server-side. */
+    kind?: string;
+    durationSecs: number;
+    when?: number;
+    notes?: string;
+  },
+): Promise<{ id: number }> {
+  const res = await fetch(`${baseUrl}/v1/workspaces/${input.workspaceId}/sessions`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({
+      kind: input.kind,
+      duration_secs: input.durationSecs,
+      when: input.when,
+      notes: input.notes,
+    }),
+  });
+  return expect<{ id: number }>(res);
+}
+
+/** Start a LIVE session row on the desktop (`POST
+ *  /v1/workspaces/:id/sessions/start`, desktop ≥ 2026-07). This is the
+ *  same tracking the in-app timer produces — the Companion's ⏱ start
+ *  literally starts Tokori's session tracking. The row is kept fresh
+ *  via `heartbeatSession` and closed with `finishSession`; the server
+ *  keeps it closed-as-of-last-heartbeat, so a client crash loses at
+ *  most one heartbeat interval. Older desktops 404 — callers fall back
+ *  to the one-shot `logSession` at session end. */
+export async function startLiveSession(
+  baseUrl: string,
+  token: string,
+  input: { workspaceId: number; kind?: string },
+): Promise<{ id: number }> {
+  const res = await fetch(`${baseUrl}/v1/workspaces/${input.workspaceId}/sessions/start`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({ kind: input.kind }),
+  });
+  return expect<{ id: number }>(res);
+}
+
+/** Desktop-issued live-session command, relayed back on heartbeats and
+ *  the control poll. `control` is one-shot (consumed on delivery);
+ *  `ended` is sticky — the user ended the session from the desktop, so
+ *  stop beating and call `finishSession` with the final numbers. */
+export interface SessionSync {
+  ended: boolean;
+  control: 'pause' | 'resume' | null;
+}
+
+function parseSessionSync(j: { ended?: unknown; control?: unknown }): SessionSync {
+  return {
+    ended: j.ended === true,
+    control: j.control === 'pause' || j.control === 'resume' ? j.control : null,
+  };
+}
+
+/** Refresh a live session with the total accrued ACTIVE seconds so far
+ *  (not a delta). `state` is sent only on the beat where the accrual
+ *  state flipped ('playing' / 'paused') — it drives the desktop
+ *  sidebar's paused badge and cancels a stale opposing desktop
+ *  command. The response carries any desktop-issued command back
+ *  (older desktops return neither field → no-op sync). */
+export async function heartbeatSession(
+  baseUrl: string,
+  token: string,
+  sessionId: number,
+  durationSecs: number,
+  state?: 'playing' | 'paused',
+): Promise<SessionSync> {
+  const res = await fetch(`${baseUrl}/v1/sessions/${sessionId}/heartbeat`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({ duration_secs: durationSecs, state }),
+  });
+  return parseSessionSync(await expect<{ ended?: boolean; control?: string }>(res));
+}
+
+/** Fast poll (~3 s while a session runs) for desktop-issued commands —
+ *  the channel that makes a desktop-side pause/resume land within a
+ *  few seconds instead of a heartbeat interval. Desktops without the
+ *  route 404 (callers mark control unsupported and stop polling). */
+export async function sessionControl(
+  baseUrl: string,
+  token: string,
+  sessionId: number,
+): Promise<SessionSync> {
+  const res = await fetch(`${baseUrl}/v1/sessions/${sessionId}/control`, {
+    headers: headers(token),
+  });
+  return parseSessionSync(await expect<{ ended?: boolean; control?: string }>(res));
+}
+
+/** Close a live session with the final numbers + a human-readable
+ *  label (video title) that surfaces it in the Activities view. */
+export async function finishSession(
+  baseUrl: string,
+  token: string,
+  sessionId: number,
+  input: { durationSecs: number; notes?: string },
+): Promise<void> {
+  const res = await fetch(`${baseUrl}/v1/sessions/${sessionId}/finish`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({ duration_secs: input.durationSecs, notes: input.notes }),
+  });
+  await expect<{ ok: boolean }>(res);
+}
+
+// ── Immersion watch list (media items) ─────────────────────────────
+
+/** A `library_items` row with a watch/listen kind, as the desktop's
+ *  `/v1/media` endpoints serialize it. */
+export interface LocalMediaItem {
+  id: number;
+  workspace_id: number;
+  kind: string;
+  title: string;
+  author: string | null;
+  source: string | null;
+  total_units: number | null;
+  unit_label: string;
+  completed_units: number;
+  total_seconds: number;
+  status: string;
+  cover_url: string | null;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Add a video/series/podcast to the desktop's Immersion watch list
+ *  (`POST /v1/workspaces/:id/media`, desktop ≥ 2026-07). Idempotent on
+ *  the canonical URL — re-adding a link returns the existing row. */
+export async function createMediaItem(
+  baseUrl: string,
+  token: string,
+  input: {
+    workspaceId: number;
+    title: string;
+    url?: string;
+    kind?: 'video' | 'series' | 'podcast';
+    author?: string;
+    /** Minutes for videos, episodes for series/podcasts. */
+    totalUnits?: number;
+    status?: string;
+  },
+): Promise<LocalMediaItem> {
+  const res = await fetch(`${baseUrl}/v1/workspaces/${input.workspaceId}/media`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({
+      title: input.title,
+      url: input.url,
+      kind: input.kind,
+      author: input.author,
+      total_units: input.totalUnits,
+      status: input.status,
+    }),
+  });
+  return expect<LocalMediaItem>(res);
+}
+
+/** The workspace's watch list, most recently touched first — feeds the
+ *  extension's library page when a desktop is paired. */
+export async function listMedia(
+  baseUrl: string,
+  token: string,
+  workspaceId: number,
+  opts: { status?: string; limit?: number } = {},
+): Promise<LocalMediaItem[]> {
+  const params = new URLSearchParams();
+  if (opts.status) params.set('status', opts.status);
+  if (opts.limit) params.set('limit', String(opts.limit));
+  const qs = params.toString();
+  const res = await fetch(`${baseUrl}/v1/workspaces/${workspaceId}/media${qs ? `?${qs}` : ''}`, {
+    headers: headers(token),
+  });
+  const page = await expect<{ data: LocalMediaItem[] }>(res);
+  return page.data;
+}
+
+/** "Is this URL on the user's watch list?" — read-only probe used to
+ *  badge the player toolbar. */
+export async function lookupMedia(
+  baseUrl: string,
+  token: string,
+  url: string,
+  workspaceId?: number,
+): Promise<{ matched: boolean; item?: LocalMediaItem }> {
+  const params = new URLSearchParams({ url });
+  if (workspaceId != null) params.set('workspace_id', String(workspaceId));
+  const res = await fetch(`${baseUrl}/v1/media/lookup?${params}`, {
+    headers: headers(token),
+  });
+  return expect<{ matched: boolean; item?: LocalMediaItem }>(res);
+}
+
+/** Playback beat for a list item (`POST /v1/media/progress`). Soft
+ *  no-match: the desktop answers `{matched:false}` for videos that
+ *  aren't on the list, so callers can report speculatively. */
+export async function reportMediaProgress(
+  baseUrl: string,
+  token: string,
+  input: {
+    url: string;
+    workspaceId?: number;
+    /** Current playback position (seconds into the media). */
+    positionSecs?: number;
+    /** Total media length in seconds — fills the item's denominator. */
+    durationSecs?: number;
+    /** Active watch seconds since the previous report. */
+    deltaSecs?: number;
+    ended?: boolean;
+  },
+): Promise<{ matched: boolean; item?: LocalMediaItem }> {
+  const res = await fetch(`${baseUrl}/v1/media/progress`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({
+      url: input.url,
+      workspace_id: input.workspaceId,
+      position_secs: input.positionSecs,
+      duration_secs: input.durationSecs,
+      delta_secs: input.deltaSecs,
+      ended: input.ended,
+    }),
+  });
+  return expect<{ matched: boolean; item?: LocalMediaItem }>(res);
 }
 
 export interface DictHit {

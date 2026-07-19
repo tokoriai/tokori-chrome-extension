@@ -31,13 +31,15 @@ export function AboutPanel({ onChange }: { onChange: () => void }) {
       <Card>
         <CardHeader>
           <CardTitle>Tokori Companion</CardTitle>
-          <CardDescription>Version 0.1.0 · local-first.</CardDescription>
+          <CardDescription>
+            Version {chrome.runtime.getManifest().version} · local-first.
+          </CardDescription>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground">
           Issues or feature requests:{' '}
           <a
             className="text-primary hover:underline"
-            href="https://github.com/tokoriai/tokori-extension/issues"
+            href="https://github.com/tokoriai/tokori-chrome-extension/issues"
             target="_blank"
             rel="noreferrer"
           >

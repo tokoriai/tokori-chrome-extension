@@ -692,6 +692,12 @@ function TargetToggle({
   );
 }
 
+const TARGET_LABELS: Record<string, string> = {
+  anki: 'Anki',
+  tokoriLocal: 'Tokori desktop',
+  tokoriCloud: 'Tokori cloud',
+};
+
 function SaveResult({
   result,
 }: {
@@ -700,20 +706,27 @@ function SaveResult({
     perTarget?: Record<string, { ok: boolean; error?: string; warning?: string }>;
   };
 }) {
-  if (result.ok && !Object.values(result.perTarget || {}).some((p) => p.warning)) {
+  const entries = Object.entries(result.perTarget || {});
+  if (result.ok && !entries.some(([, p]) => p.warning)) {
     return <span style={s({ color: TOKENS.ok, fontSize: '12px' })}>Saved.</span>;
   }
   if (!result.ok) {
+    // Name the failing target(s) — the background's summary line is a
+    // generic "one or more failed", which tells the user nothing.
+    const failures = entries
+      .filter(([, p]) => !p.ok)
+      .map(([k, p]) => `${TARGET_LABELS[k] || k}: ${p.error || 'failed'}`)
+      .join(' · ');
     return (
       <span style={s({ color: TOKENS.err, fontSize: '12px', maxWidth: '320px' })}>
-        {result.error || 'Save failed.'}
+        {failures || result.error || 'Save failed.'}
       </span>
     );
   }
   // Partial / warnings
-  const warnings = Object.entries(result.perTarget || {})
+  const warnings = entries
     .filter(([, p]) => p.warning)
-    .map(([k, p]) => `${k}: ${p.warning}`)
+    .map(([k, p]) => `${TARGET_LABELS[k] || k}: ${p.warning}`)
     .join(' · ');
   return (
     <span style={s({ color: TOKENS.warn, fontSize: '12px', maxWidth: '320px' })}>{warnings}</span>

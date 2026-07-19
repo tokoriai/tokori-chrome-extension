@@ -16,6 +16,7 @@ import {
   addNote,
   storeMediaFile,
   makeMediaFilename,
+  stripDataUrl,
   type AddNoteInput,
 } from './lib/anki';
 import { buildAnkiFields, mimeToExt } from './lib/anki-fields';
@@ -34,11 +35,13 @@ import {
   freeTranslate,
   explain,
   chatOnce,
+  visionOnce,
   buildDefinePrompt,
   parseDefineResponse,
 } from './lib/ai-providers';
 import { debug, warn } from './lib/log';
-import { detectLanguage, type LanguageCode } from './lib/languages';
+import { detectLanguage, getLanguage, type LanguageCode } from './lib/languages';
+import { tesseractLangFor } from './lib/ocr-cues';
 import {
   lookup as localDictLookup,
   listMeta,
@@ -51,6 +54,25 @@ import { installCedict, diacriticPinyin } from './lib/dictionaries/cedict';
 import { installJmdictQuick } from './lib/dictionaries/jmdict';
 import * as tcloud from './lib/tokori-cloud';
 import * as tlocal from './lib/tokori-local';
+import {
+  addToDay,
+  applyBeat,
+  finalizeActive,
+  pushSession,
+  removeSession,
+  totals,
+  STALE_ACTIVE_MS,
+  type ImmersionActive,
+  type ImmersionDayMap,
+  type ImmersionSessionEntry,
+} from './lib/immersion';
+import {
+  addLocalLibraryItem,
+  applyLocalLibraryBeat,
+  listLocalLibrary,
+  lookupLocalLibrary,
+  removeLocalLibraryItem,
+} from './lib/local-library';
 
 // ── Cached state ──────────────────────────────────────────────────
 //
@@ -72,8 +94,12 @@ let CLOUD_WORKSPACE_ID: number | null = null;
  *  no desktop is paired, the signed-in cloud workspace). The value is
  *  the FSRS-ish status string (`new` | `learning` | `review` |
  *  `mastered`) so content scripts can colour the underline by status,
- *  mirroring the Tokori desktop chat surface. Refreshed every few
- *  minutes by an alarm. Consumed via the `getKnownWords` message. */
+ *  mirroring the Tokori desktop chat surface. Consumed via the
+ *  `getKnownWords` message with stale-while-revalidate semantics: a
+ *  snapshot persisted in chrome.storage.local survives worker
+ *  idle-unloads (restored in bootCache), reads revalidate lazily via
+ *  ensureKnownWords(), and every real change is pushed to open tabs
+ *  through the snapshot write itself (storage.onChanged). */
 let KNOWN_WORDS: Map<string, string> = new Map();
 
 async function bootCache() {
@@ -88,6 +114,28 @@ async function bootCache() {
   PREFER_DESKTOP_DICT = s.preferDesktopDict;
   LOCAL_WORKSPACE_ID = s.localWorkspaceId;
   CLOUD_WORKSPACE_ID = s.cloudWorkspaceId;
+  // Adopt the persisted known-words snapshot (if it still matches the
+  // configured backend + workspace) so the first consumer after a
+  // worker wake paints instantly; ensureKnownWords() revalidates in
+  // the background when the snapshot is stale.
+  try {
+    const stored = await chrome.storage.local.get(KNOWN_WORDS_SNAPSHOT_KEY);
+    const snap = stored[KNOWN_WORDS_SNAPSHOT_KEY] as KnownWordsSnapshot | undefined;
+    const matches =
+      snap?.v === 1 && Array.isArray(snap.items)
+        ? snap.source === 'desktop'
+          ? !!s.localApi.token && s.localWorkspaceId === snap.workspaceId
+          : !!s.cloud.token && s.cloudWorkspaceId === snap.workspaceId
+        : false;
+    if (snap && matches && KNOWN_WORDS_AT === 0) {
+      KNOWN_WORDS = new Map(snap.items);
+      KNOWN_WORDS_AT = snap.at;
+      KNOWN_WORDS_SOURCE = snap.source;
+      KNOWN_WORDS_PERSISTED = JSON.stringify(snap.items);
+    }
+  } catch (e) {
+    warn('known-words snapshot restore failed:', e);
+  }
 }
 // Handlers that branch on the cached snapshot await this before reading
 // it — an MV3 worker woken *by* a message would otherwise dispatch the
@@ -130,6 +178,56 @@ let knownWordsInflight: Promise<void> | null = null;
 let KNOWN_WORDS_SOURCE: 'desktop' | 'cloud' | 'none' = 'none';
 let KNOWN_WORDS_ERROR: string | null = null;
 
+/** How long a loaded map stays servable without a revalidation. */
+const KNOWN_WORDS_TTL_MS = 120_000;
+
+/** storage.local key holding the last good KNOWN_WORDS load. Two jobs:
+ *  (1) worker wakes restore it in bootCache() so captions colour
+ *  instantly (stale-while-revalidate) instead of waiting on a network
+ *  round trip, and (2) every rewrite fires storage.onChanged in ALL
+ *  content scripts — that's the push channel that recolours open tabs
+ *  after a refresh or grade, with zero per-tab bookkeeping. */
+const KNOWN_WORDS_SNAPSHOT_KEY = 'knownWordsSnapshot';
+
+interface KnownWordsSnapshot {
+  v: 1;
+  /** Epoch ms of the fetch that produced `items` — drives staleness. */
+  at: number;
+  source: 'desktop' | 'cloud';
+  /** Workspace the items belong to. A mismatch at boot (workspace
+   *  switched while the worker was dead) discards the snapshot. */
+  workspaceId: number;
+  items: [string, string][];
+}
+
+/** JSON of the last persisted `items` — identical content is skipped so
+ *  the storage push only fires when the map actually changed. */
+let KNOWN_WORDS_PERSISTED = '';
+
+/** Persist KNOWN_WORDS to the snapshot (or clear it on sign-out). Safe
+ *  to call after every mutation — unchanged content is a no-op. */
+function persistKnownWords(): void {
+  if (KNOWN_WORDS_SOURCE === 'none') {
+    KNOWN_WORDS_PERSISTED = '';
+    void chrome.storage.local.remove(KNOWN_WORDS_SNAPSHOT_KEY);
+    return;
+  }
+  const workspaceId = KNOWN_WORDS_SOURCE === 'desktop' ? LOCAL_WORKSPACE_ID : CLOUD_WORKSPACE_ID;
+  if (workspaceId == null) return;
+  const items = Array.from(KNOWN_WORDS);
+  const json = JSON.stringify(items);
+  if (json === KNOWN_WORDS_PERSISTED) return;
+  KNOWN_WORDS_PERSISTED = json;
+  const snap: KnownWordsSnapshot = {
+    v: 1,
+    at: KNOWN_WORDS_AT,
+    source: KNOWN_WORDS_SOURCE,
+    workspaceId,
+    items,
+  };
+  void chrome.storage.local.set({ [KNOWN_WORDS_SNAPSHOT_KEY]: snap });
+}
+
 /** Adopt a workspace when a token exists but no workspace was ever
  *  picked. The popup's pair flow (and the auth handoff) only store the
  *  token — historically the workspace was only resolved when the user
@@ -161,7 +259,16 @@ async function ensureWorkspaceIds(): Promise<void> {
   }
 }
 
+/** SRS statuses that render a non-neutral caption colour — the same
+ *  set `statusColorFor` (caption-style.ts) paints. `unseen` is omitted
+ *  on purpose: it renders identically to an absent word, so it never
+ *  needs a slot in KNOWN_WORDS. Keep in sync with caption-style.ts. */
+const HIGHLIGHT_STATUSES = ['new', 'learning', 'review', 'mastered'] as const;
+
 async function refreshKnownWords() {
+  // A refresh fired right at worker boot (onStartup, desktop-online
+  // flip) must not race bootCache() and read null tokens.
+  await cacheReady;
   await ensureWorkspaceIds();
   let lastError: string | null = null;
   // Desktop first (fast loopback, no quota), signed-in cloud account as
@@ -171,17 +278,31 @@ async function refreshKnownWords() {
   // refuses instantly and we fall through to cloud.
   if (LOCAL_API_TOKEN && LOCAL_WORKSPACE_ID != null) {
     try {
-      const rows = await tlocal.listVocab(LOCAL_API_BASE, LOCAL_API_TOKEN, LOCAL_WORKSPACE_ID, {
-        limit: 500,
-      });
+      // The desktop caps `/vocab` at 500 rows server-side and returns
+      // them newest-first with no offset paging, so a single fetch on a
+      // >500-word workspace silently drops the OLDEST rows — which are
+      // exactly the earliest-learned, most-mastered everyday words (在,
+      // 的, …) that would then render as "unknown" in captions. The
+      // `status` filter is applied *before* that cap, so fetch each
+      // highlightable status on its own 500-row budget and merge.
+      const token = LOCAL_API_TOKEN;
+      const workspaceId = LOCAL_WORKSPACE_ID;
+      const perStatus = await Promise.all(
+        HIGHLIGHT_STATUSES.map((status) =>
+          tlocal.listVocab(LOCAL_API_BASE, token, workspaceId, { status, limit: 500 }),
+        ),
+      );
       const next = new Map<string, string>();
-      for (const r of rows) {
-        if (r.word) next.set(r.word, r.status || 'new');
+      for (const rows of perStatus) {
+        for (const r of rows) {
+          if (r.word) next.set(r.word, r.status || 'new');
+        }
       }
       KNOWN_WORDS = next;
       KNOWN_WORDS_AT = Date.now();
       KNOWN_WORDS_SOURCE = 'desktop';
       KNOWN_WORDS_ERROR = null;
+      persistKnownWords();
       return;
     } catch (e) {
       lastError = `Tokori desktop: ${e instanceof Error ? e.message : String(e)}`;
@@ -199,18 +320,29 @@ async function refreshKnownWords() {
       KNOWN_WORDS_AT = Date.now();
       KNOWN_WORDS_SOURCE = 'cloud';
       KNOWN_WORDS_ERROR = null;
+      persistKnownWords();
       return;
     } catch (e) {
       lastError = `Tokori cloud: ${e instanceof Error ? e.message : String(e)}`;
       warn('refreshKnownWords (cloud) failed:', e);
     }
   }
+  // Nothing succeeded. Two very different cases:
+  //  - transient outage (desktop quit / cloud down) with data already
+  //    loaded → KEEP serving the stale map rather than wiping caption
+  //    colours mid-video; `error` says why and the TTL retries.
+  //  - genuinely no backend (signed out / never paired) → clear the
+  //    map and the persisted snapshot.
+  KNOWN_WORDS_ERROR = lastError;
+  // Stamp even failures so an unpaired install doesn't retry the whole
+  // chain on every single message.
+  KNOWN_WORDS_AT = Date.now();
+  const hasBackend =
+    (LOCAL_API_TOKEN && LOCAL_WORKSPACE_ID != null) || (CLOUD_TOKEN && CLOUD_WORKSPACE_ID != null);
+  if (hasBackend && KNOWN_WORDS.size) return;
   KNOWN_WORDS = new Map();
   KNOWN_WORDS_SOURCE = 'none';
-  KNOWN_WORDS_ERROR = lastError;
-  // Stamp even the "no connection" outcome so an unpaired install
-  // doesn't retry the whole chain on every single message.
-  KNOWN_WORDS_AT = Date.now();
+  persistKnownWords();
 }
 
 /** Make sure KNOWN_WORDS reflects a load from this worker lifetime (or
@@ -218,7 +350,7 @@ async function refreshKnownWords() {
  *  handler that reads the map calls this first — without it, the first
  *  `getKnownWords` after an idle-unload would see an empty map and
  *  captions would silently lose their colours. */
-async function ensureKnownWords(maxAgeMs = 120_000): Promise<void> {
+async function ensureKnownWords(maxAgeMs = KNOWN_WORDS_TTL_MS): Promise<void> {
   if (Date.now() - KNOWN_WORDS_AT < maxAgeMs) return;
   if (!knownWordsInflight) {
     knownWordsInflight = refreshKnownWords().finally(() => {
@@ -226,6 +358,16 @@ async function ensureKnownWords(maxAgeMs = 120_000): Promise<void> {
     });
   }
   await knownWordsInflight;
+}
+
+/** SWR gate used by the read handlers: block only when the map has
+ *  never been filled at all (first run, or the persisted snapshot was
+ *  discarded); otherwise answer instantly from what's in memory and,
+ *  when that's older than the TTL, kick a background revalidation —
+ *  its snapshot push updates consumers the moment fresh data lands. */
+async function knownWordsReady(): Promise<void> {
+  if (KNOWN_WORDS_AT === 0) return ensureKnownWords();
+  if (Date.now() - KNOWN_WORDS_AT >= KNOWN_WORDS_TTL_MS) void ensureKnownWords();
 }
 
 /** Where vocab-state operations (status grading, collections) can go
@@ -289,13 +431,312 @@ async function refreshDesktopStatus() {
   }
 }
 
-const KNOWN_WORDS_ALARM = 'tokori-known-words-refresh';
 chrome.alarms.create(DESKTOP_PING_ALARM, { periodInMinutes: 1, when: Date.now() + 2_000 });
-chrome.alarms.create(KNOWN_WORDS_ALARM, { periodInMinutes: 5, when: Date.now() + 5_000 });
+// The fixed 5-min known-words alarm is gone: reads revalidate through
+// knownWordsReady()/ensureKnownWords() (stale-while-revalidate) and
+// changes push via the storage snapshot — so the network is only hit
+// while something is actually consuming the map. Clear the alarm any
+// older install left registered.
+void chrome.alarms.clear('tokori-known-words-refresh');
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === DESKTOP_PING_ALARM) void refreshDesktopStatus();
-  if (alarm.name === KNOWN_WORDS_ALARM) void refreshKnownWords();
 });
+
+// ── Immersion tracking (study mode) ───────────────────────────────
+//
+// The YT enhancer's ⏱ pill starts/stops a session; while one is
+// active the content script posts heartbeat deltas of actually-watched
+// time (video playing; wall-clock when the count-while-paused option
+// is on). Persistence lives in chrome.storage.local so the stats page
+// works fully standalone and survives worker unloads / browser
+// restarts. Finished sessions are additionally pushed into the paired
+// Tokori desktop's study_sessions table (kind 'immersion') so the
+// desktop dashboard's KPIs / heatmap / streak count Companion time —
+// best-effort, retried while entries remain unsynced.
+
+const IMMERSION_ACTIVE_KEY = 'immersionActive';
+const IMMERSION_DAYS_KEY = 'immersionDays';
+const IMMERSION_SESSIONS_KEY = 'immersionSessions';
+
+/** Content beats arrive every ~10s; the desktop's live row only needs
+ *  one every ~30s (each UPDATE marks the row dirty for cloud sync).
+ *  Accrual-state transitions (pause/resume) bypass the throttle — the
+ *  desktop chip should flip within a second, not half a minute. */
+const DESKTOP_BEAT_INTERVAL_MS = 30_000;
+let lastDesktopBeatAt = 0;
+
+/** Desktop-issued command picked up by a heartbeat response, held for
+ *  the next content control poll (which applies the video-level
+ *  effect). One-shot + session-scoped: cleared on start and finalize. */
+let pendingLiveControl: 'pause' | 'resume' | null = null;
+/** True once the paired desktop 404'd the control route (older build)
+ *  — stops the ~3 s poll from hammering a route that isn't there.
+ *  Reset on session start; the desktop may have been updated since. */
+let liveControlUnsupported = false;
+
+/** Forward a live-row heartbeat (+ optional accrual transition) to the
+ *  desktop. The response doubles as the desktop's back-channel: a
+ *  queued pause/resume is stashed for the next content control poll,
+ *  and a sticky `ended` finalizes the session outright — the safety
+ *  net for when the fast poll isn't running (no content surface
+ *  alive), costing at most one unflushed content beat (~10 s). */
+async function pushDesktopBeat(
+  sessionId: number,
+  ms: number,
+  state?: 'playing' | 'paused',
+): Promise<void> {
+  try {
+    await cacheReady;
+    if (!LOCAL_API_TOKEN) return;
+    const sync = await tlocal.heartbeatSession(
+      LOCAL_API_BASE,
+      LOCAL_API_TOKEN,
+      sessionId,
+      Math.round(ms / 1000),
+      state,
+    );
+    if (sync.ended) {
+      await finalizeImmersion(Date.now());
+      return;
+    }
+    if (sync.control) pendingLiveControl = sync.control;
+  } catch (e) {
+    warn('immersion live heartbeat failed:', e);
+  }
+}
+
+// ── Watch-list progress forwarding ──────────────────────────────────
+//
+// Immersion beats carry the player's position/duration; the desktop's
+// `/v1/media/progress` turns those into per-video progress for items
+// on the user's Immersion watch list (soft no-op for everything else).
+// Beats accumulate here and flush on the same 30 s cadence as the
+// session heartbeat; a video change flushes the old video's tail first
+// so its seconds aren't credited to the next one.
+
+interface PendingMediaBeat {
+  url: string;
+  deltaMs: number;
+  positionSec?: number;
+  durationSec?: number;
+  ended?: boolean;
+}
+let pendingMediaBeat: PendingMediaBeat | null = null;
+let lastMediaFlushAt = 0;
+
+async function flushMediaProgress(force = false): Promise<void> {
+  if (!pendingMediaBeat) return;
+  const now = Date.now();
+  if (!force && now - lastMediaFlushAt < DESKTOP_BEAT_INTERVAL_MS) return;
+  // Detach synchronously — a new beat may land while the fetch is in
+  // flight and must start a fresh accumulator, not be clobbered.
+  const beat = pendingMediaBeat;
+  pendingMediaBeat = null;
+  lastMediaFlushAt = now;
+  try {
+    await cacheReady;
+    if (LOCAL_API_TOKEN) {
+      await tlocal.reportMediaProgress(LOCAL_API_BASE, LOCAL_API_TOKEN, {
+        url: beat.url,
+        workspaceId: LOCAL_WORKSPACE_ID ?? undefined,
+        positionSecs: beat.positionSec,
+        durationSecs: beat.durationSec,
+        deltaSecs: Math.round(beat.deltaMs / 1000) || undefined,
+        ended: beat.ended,
+      });
+      return;
+    }
+    // No desktop paired — the in-browser library is the store.
+    await applyLocalLibraryBeat(beat.url, {
+      deltaMs: beat.deltaMs,
+      positionSec: beat.positionSec,
+      durationSec: beat.durationSec,
+      ended: beat.ended,
+    });
+  } catch (e) {
+    // Soft-fail: the next beat re-reports position (idempotent via
+    // furthest-watched semantics); only the delta seconds are lost.
+    warn('media progress beat failed:', e);
+  }
+}
+
+function noteMediaBeat(
+  req: { url?: unknown; positionSec?: unknown; durationSec?: unknown; ended?: unknown },
+  deltaMs: number,
+): void {
+  const url = typeof req.url === 'string' && req.url ? req.url : null;
+  if (!url) return;
+  if (pendingMediaBeat && pendingMediaBeat.url !== url) void flushMediaProgress(true);
+  if (!pendingMediaBeat || pendingMediaBeat.url !== url) {
+    pendingMediaBeat = { url, deltaMs: 0 };
+  }
+  pendingMediaBeat.deltaMs += Math.max(0, deltaMs);
+  if (typeof req.positionSec === 'number') pendingMediaBeat.positionSec = req.positionSec;
+  if (typeof req.durationSec === 'number') pendingMediaBeat.durationSec = req.durationSec;
+  if (req.ended === true) pendingMediaBeat.ended = true;
+  void flushMediaProgress();
+}
+
+async function getImmersionStore(): Promise<{
+  active: ImmersionActive | null;
+  days: ImmersionDayMap;
+  sessions: ImmersionSessionEntry[];
+}> {
+  const r = await chrome.storage.local.get([
+    IMMERSION_ACTIVE_KEY,
+    IMMERSION_DAYS_KEY,
+    IMMERSION_SESSIONS_KEY,
+  ]);
+  return {
+    active: (r[IMMERSION_ACTIVE_KEY] as ImmersionActive | undefined) || null,
+    days: (r[IMMERSION_DAYS_KEY] as ImmersionDayMap | undefined) || {},
+    sessions: (r[IMMERSION_SESSIONS_KEY] as ImmersionSessionEntry[] | undefined) || [],
+  };
+}
+
+/** End the running session at `endedAt`: fold it into the day totals +
+ *  session log (unless too short) and close it out on the desktop. */
+async function finalizeImmersion(endedAt: number): Promise<ImmersionSessionEntry | null> {
+  const { active, days, sessions } = await getImmersionStore();
+  // A stale queued command must never leak into the next session.
+  pendingLiveControl = null;
+  if (!active) return null;
+  const entry = finalizeActive(active, endedAt);
+  const liveId = active.desktopSessionId ?? null;
+  if (entry && liveId != null) {
+    // The desktop tracked this live (kind 'video'); finish the row in
+    // place with the final numbers + title. Marked synced up front:
+    // even when the finish call misses (desktop just quit), the live
+    // row already holds the last heartbeat — re-logging through the
+    // one-shot fallback would double-count it.
+    entry.synced = true;
+    void (async () => {
+      try {
+        await cacheReady;
+        if (!LOCAL_API_TOKEN) return;
+        await tlocal.finishSession(LOCAL_API_BASE, LOCAL_API_TOKEN, liveId, {
+          durationSecs: Math.round(entry.ms / 1000),
+          notes: `Companion: ${entry.title || entry.url || 'video'}`,
+        });
+      } catch (e) {
+        warn('immersion live finish failed:', e);
+      }
+    })();
+  }
+  if (entry) {
+    addToDay(days, entry.end, entry.ms);
+    await chrome.storage.local.set({
+      [IMMERSION_DAYS_KEY]: days,
+      [IMMERSION_SESSIONS_KEY]: pushSession(sessions, entry),
+    });
+  }
+  await chrome.storage.local.remove(IMMERSION_ACTIVE_KEY);
+  if (entry && !entry.synced) void syncImmersionSessions();
+  return entry;
+}
+
+/** Push unsynced finished sessions into the paired desktop. A miss
+ *  (desktop closed / pre-sessions-route build) leaves `synced:false`
+ *  and the next finalize / stats read retries. */
+let immersionSyncInflight = false;
+async function syncImmersionSessions(): Promise<void> {
+  if (immersionSyncInflight) return;
+  immersionSyncInflight = true;
+  try {
+    await cacheReady;
+    if (!LOCAL_API_TOKEN || LOCAL_WORKSPACE_ID == null) return;
+    const token = LOCAL_API_TOKEN;
+    const workspaceId = LOCAL_WORKSPACE_ID;
+    const { sessions } = await getImmersionStore();
+    const done = new Set<number>();
+    for (const s of sessions) {
+      if (s.synced) continue;
+      try {
+        await tlocal.logSession(LOCAL_API_BASE, token, {
+          workspaceId,
+          kind: 'video',
+          durationSecs: Math.round(s.ms / 1000),
+          when: Math.round(s.end / 1000),
+          notes: `Companion: ${s.title || s.url || 'video'}`,
+        });
+        done.add(s.start);
+      } catch (e) {
+        warn('immersion desktop sync failed:', e);
+        break; // unreachable / old build — retry the rest later
+      }
+    }
+    if (done.size) {
+      // Re-read before writing — a session may have been finalized
+      // while the pushes were in flight.
+      const { sessions: latest } = await getImmersionStore();
+      await chrome.storage.local.set({
+        [IMMERSION_SESSIONS_KEY]: latest.map((s) =>
+          done.has(s.start) ? { ...s, synced: true } : s,
+        ),
+      });
+    }
+  } finally {
+    immersionSyncInflight = false;
+  }
+}
+
+// Crash recovery: an active session whose heartbeats stopped long ago
+// (tab crashed, browser quit) is finalized at its last beat so the
+// tracked time isn't lost — and isn't inflated by the dead gap.
+void (async () => {
+  const { active } = await getImmersionStore();
+  if (active && Date.now() - active.lastBeatAt > STALE_ACTIVE_MS) {
+    await finalizeImmersion(active.lastBeatAt);
+  }
+})();
+
+// ── Local OCR (offscreen tesseract host) ──────────────────────────
+//
+// The local burned-in-subtitle OCR runs tesseract.js in a
+// chrome.offscreen document (MV3 service workers can't spawn the Web
+// Worker it needs). Created lazily on the first OCR/warmup call and
+// left alive — the worker stays warm between samples.
+
+let offscreenReady: Promise<void> | null = null;
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error('This Chrome version has no offscreen API (needs Chrome 109+).');
+  }
+  // Single-flight: concurrent createDocument calls throw.
+  offscreenReady ??= (async () => {
+    const has = await chrome.offscreen.hasDocument();
+    if (!has) {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: [chrome.offscreen.Reason.WORKERS],
+        justification:
+          'Runs the local OCR engine (WebAssembly worker) that reads burned-in video subtitles.',
+      });
+    }
+  })().catch((e) => {
+    offscreenReady = null; // allow a retry after a failure
+    throw e;
+  });
+  await offscreenReady;
+}
+
+/** Round-trip one OCR/warmup request to the offscreen host. */
+async function offscreenOcr(msg: {
+  type: 'tokori-local-ocr' | 'tokori-local-ocr-warmup';
+  dataUrl?: string;
+  tessLang: string;
+  /** The crop is already binarized by the sender — skip preprocessing. */
+  prepared?: boolean;
+}): Promise<{ text: string; confidence: number }> {
+  await ensureOffscreenDocument();
+  const res = (await chrome.runtime.sendMessage(msg)) as
+    { success?: boolean; text?: string; confidence?: number; error?: string } | undefined;
+  if (!res?.success) {
+    throw new Error(res?.error || 'The local OCR engine did not answer.');
+  }
+  return { text: res.text || '', confidence: res.confidence ?? 0 };
+}
 
 // ── Install / boot ────────────────────────────────────────────────
 
@@ -319,6 +760,22 @@ chrome.runtime.onStartup?.addListener(() => {
 // keep growing through long-running browser sessions.
 chrome.tabs.onRemoved.addListener((tabId) => {
   void setTabOverride(tabId, null);
+});
+
+// Warm the known-words cache the moment a YouTube navigation starts —
+// by the time the player and the content script are up, the colours
+// are already in memory ("pull it before the video starts"). TTL-gated
+// through ensureKnownWords, so SPA hops inside YouTube are free.
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  const url = changeInfo.url ?? (changeInfo.status === 'loading' ? tab.url : undefined);
+  if (!url) return;
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return;
+  }
+  if (host === 'youtube.com' || host.endsWith('.youtube.com')) void ensureKnownWords();
 });
 
 // ── External auth: app.tokori.ai posts the bearer token to us once
@@ -362,14 +819,6 @@ chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => 
 });
 
 // ── Helpers ───────────────────────────────────────────────────────
-
-/** `data:video/webm;base64,AAAA…` → `AAAA…`. The desktop's
- *  `audio_data` column takes bare base64 (decoded server-side into a
- *  BLOB), unlike `image_data` which stores the data URL verbatim. */
-function stripDataUrlPrefix(dataUrl: string): string {
-  const comma = dataUrl.indexOf(',');
-  return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-}
 
 function cloudOnly(send: (r: unknown) => void): boolean {
   if (!CLOUD_TOKEN) {
@@ -423,9 +872,9 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
   if (request.action === 'getKnownWords') {
     (async () => {
       await cacheReady;
-      // Reload lazily — the worker may have just been woken by this very
-      // message with an empty module-scope cache.
-      await ensureKnownWords();
+      // Serve whatever we have — this lifetime's load or the restored
+      // snapshot — immediately; block only when there's truly nothing.
+      await knownWordsReady();
       // `items` is the new shape ({word, status}); `words` is kept for one
       // release so content scripts on the old shape still highlight words
       // even if just in a single colour. `source`/`error` let the caption
@@ -833,15 +1282,13 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
             front_extra: frontExtra || undefined,
             card_notes: cardNotes || undefined,
             image_data: image?.dataUrl,
-            // Current desktop builds have no clip columns yet, but they DO
-            // store card audio (bare base64 → BLOB). Bridge the captured
-            // clip in as the card's audio so mined cards play sound on the
-            // desktop today; `clip_data` stays on the payload for builds
-            // that grow real clip support.
-            audio_data: clip?.dataUrl ? stripDataUrlPrefix(clip.dataUrl) : undefined,
+            // The desktop has no clip columns, but it DOES store card
+            // audio (bare base64 → BLOB). Bridge the captured clip in as
+            // the card's audio so mined cards play sound on the desktop.
+            // Sent ONCE — a duplicate `clip_data` copy used to double the
+            // multi-MB body and trip the desktop's request-size limit.
+            audio_data: clip?.dataUrl ? stripDataUrl(clip.dataUrl) : undefined,
             audio_mime: clip?.mime,
-            clip_data: clip?.dataUrl,
-            clip_mime: clip?.mime,
           });
           results.tokoriLocal = { ok: true, id: r.id };
         } catch (e) {
@@ -884,12 +1331,261 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
       // highlighting picks it up without waiting for the next refresh.
       if ((results.tokoriLocal?.ok || results.tokoriCloud?.ok) && word && !KNOWN_WORDS.has(word)) {
         KNOWN_WORDS.set(word, 'new');
+        persistKnownWords();
       }
       sendResponse({
         success: allOk,
         results,
         error: allOk ? undefined : 'One or more targets failed — see results.',
       });
+    })();
+    return true;
+  }
+
+  // ── Immersion tracking ──
+  // Start / heartbeat / stop for the study-mode timer, plus read-only
+  // state for the toolbar pill and the stats page. One global session
+  // at a time — the timer follows the user, not a tab.
+  if (request.action === 'immersionStart') {
+    (async () => {
+      const now = Date.now();
+      const { active } = await getImmersionStore();
+      // A live session (recent beats) is simply adopted — e.g. the
+      // pill in a second tab. A stale one is finalized first.
+      if (active && now - active.lastBeatAt <= STALE_ACTIVE_MS) {
+        sendResponse({ success: true, active: true, startedAt: active.startedAt, ms: active.ms });
+        return;
+      }
+      if (active) await finalizeImmersion(active.lastBeatAt);
+      const fresh: ImmersionActive = {
+        startedAt: now,
+        ms: 0,
+        lastBeatAt: now,
+        title: (request.title as string) || null,
+        url: (request.url as string) || null,
+        paused: false,
+      };
+      // Session-scoped control state resets with the session.
+      pendingLiveControl = null;
+      liveControlUnsupported = false;
+      lastDesktopBeatAt = 0;
+      await chrome.storage.local.set({ [IMMERSION_ACTIVE_KEY]: fresh });
+      sendResponse({ success: true, active: true, startedAt: now, ms: 0 });
+      // Mirror the start into the paired desktop as a LIVE 'video'
+      // session — Tokori's own session tracking starts with ours.
+      // Best-effort: unpaired / offline / pre-live-API desktops fall
+      // back to the one-shot log at session end.
+      try {
+        await cacheReady;
+        if (!LOCAL_API_TOKEN || LOCAL_WORKSPACE_ID == null) return;
+        const r = await tlocal.startLiveSession(LOCAL_API_BASE, LOCAL_API_TOKEN, {
+          workspaceId: LOCAL_WORKSPACE_ID,
+          kind: 'video',
+        });
+        // Attach onto the CURRENT stored state — a heartbeat may have
+        // landed while the start call was in flight.
+        const { active: cur } = await getImmersionStore();
+        if (cur && cur.startedAt === now) {
+          await chrome.storage.local.set({
+            [IMMERSION_ACTIVE_KEY]: { ...cur, desktopSessionId: r.id },
+          });
+        }
+      } catch (e) {
+        warn('immersion live start failed (one-shot fallback stays):', e);
+      }
+    })();
+    return true;
+  }
+  if (request.action === 'immersionBeat') {
+    (async () => {
+      const now = Date.now();
+      const { active } = await getImmersionStore();
+      if (!active) {
+        // Session was finalized elsewhere (stop in another tab, crash
+        // recovery) — tell the pill to flip off.
+        sendResponse({ success: true, active: false });
+        return;
+      }
+      const next = applyBeat(active, Number(request.deltaMs) || 0, now);
+      // Freshen the label so the log names the most recent video.
+      if (typeof request.title === 'string' && request.title) next.title = request.title;
+      if (typeof request.url === 'string' && request.url) next.url = request.url;
+      // Accrual-state edge reported by the content ticker (only sent
+      // on the beat where it flipped). This is what makes an organic
+      // video pause show up as "Paused" on the desktop chip — and an
+      // organic play outrank a stale desktop pause (the server cancels
+      // the opposing queued command on our transition).
+      let transition: 'playing' | 'paused' | undefined;
+      if (typeof request.playing === 'boolean') {
+        const nowPaused = !request.playing;
+        if (nowPaused !== !!next.paused) {
+          next.paused = nowPaused;
+          transition = nowPaused ? 'paused' : 'playing';
+        }
+      }
+      await chrome.storage.local.set({ [IMMERSION_ACTIVE_KEY]: next });
+      sendResponse({
+        success: true,
+        active: true,
+        startedAt: next.startedAt,
+        ms: next.ms,
+        paused: !!next.paused,
+      });
+      // Advance the watch-list item this video maps to (if any) —
+      // accumulated + throttled, so it shares the session heartbeat's
+      // write cadence.
+      noteMediaBeat(request, Number(request.deltaMs) || 0);
+      // Forward to the desktop's live row, throttled — every content
+      // beat (10s) would churn the desktop's cloud-sync dirty flags
+      // for no benefit. Transitions skip the throttle so the chip
+      // flips promptly. Fire-and-forget; the row self-repairs on the
+      // next beat.
+      if (
+        next.desktopSessionId != null &&
+        (transition || now - lastDesktopBeatAt >= DESKTOP_BEAT_INTERVAL_MS)
+      ) {
+        lastDesktopBeatAt = now;
+        await pushDesktopBeat(next.desktopSessionId, next.ms, transition);
+      }
+    })();
+    return true;
+  }
+  if (request.action === 'immersionStop') {
+    (async () => {
+      const now = Date.now();
+      const { active } = await getImmersionStore();
+      if (!active) {
+        sendResponse({ success: true, active: false, entry: null });
+        return;
+      }
+      // Credit the final partial beat before closing the session.
+      const withTail = applyBeat(active, Number(request.deltaMs) || 0, now);
+      await chrome.storage.local.set({ [IMMERSION_ACTIVE_KEY]: withTail });
+      // Final watch-list beat — carries the last position + the tail
+      // seconds, force-flushed so stopping never strands progress.
+      noteMediaBeat(request, Number(request.deltaMs) || 0);
+      void flushMediaProgress(true);
+      const entry = await finalizeImmersion(now);
+      sendResponse({ success: true, active: false, entry });
+    })();
+    return true;
+  }
+  if (request.action === 'immersionState') {
+    (async () => {
+      const now = Date.now();
+      const { active, days } = await getImmersionStore();
+      const live = active && now - active.lastBeatAt <= STALE_ACTIVE_MS ? active : null;
+      sendResponse({
+        success: true,
+        active: !!live,
+        startedAt: live?.startedAt ?? null,
+        ms: live?.ms ?? 0,
+        paused: !!live?.paused,
+        // Running time isn't folded into the day map until stop —
+        // include it so "today" reads live.
+        todayMs: totals(days, now).todayMs + (live?.ms ?? 0),
+      });
+    })();
+    return true;
+  }
+  // Fast control channel: content surfaces poll this every ~3 s while
+  // a session runs, so a desktop-issued pause/resume/end lands within
+  // seconds instead of a heartbeat interval. The background gates the
+  // actual HTTP on having a live desktop row and a desktop new enough
+  // to expose the route; the video-level effect (pausing the player)
+  // happens in the polling content script via the returned `control`.
+  if (request.action === 'immersionControlPoll') {
+    (async () => {
+      const { active } = await getImmersionStore();
+      if (!active) {
+        sendResponse({ success: true, active: false });
+        return;
+      }
+      // A command may already be waiting, picked up by a 30 s
+      // heartbeat's response.
+      let control = pendingLiveControl;
+      pendingLiveControl = null;
+      let ended = false;
+      if (!control && active.desktopSessionId != null && !liveControlUnsupported) {
+        try {
+          await cacheReady;
+          if (LOCAL_API_TOKEN) {
+            const sync = await tlocal.sessionControl(
+              LOCAL_API_BASE,
+              LOCAL_API_TOKEN,
+              active.desktopSessionId,
+            );
+            control = sync.control;
+            ended = sync.ended;
+          }
+        } catch (e) {
+          if (e instanceof tlocal.LocalApiError && e.status === 404) {
+            liveControlUnsupported = true;
+          }
+          // Transient miss: answer local state; the next poll retries.
+        }
+      }
+      if (ended) {
+        // The user ended the session from the desktop. Don't finalize
+        // here — the content script answers by sending its unflushed
+        // tail through the normal immersionStop path. `ended` is
+        // sticky server-side, so a lost response just redelivers.
+        sendResponse({
+          success: true,
+          active: true,
+          endRequested: true,
+          paused: !!active.paused,
+        });
+        return;
+      }
+      if (control) {
+        // Session-level effect here; the desktop chip flips only on
+        // our confirming transition beat, so send it right away.
+        const nowPaused = control === 'pause';
+        if (nowPaused !== !!active.paused) {
+          const next = { ...active, paused: nowPaused };
+          await chrome.storage.local.set({ [IMMERSION_ACTIVE_KEY]: next });
+          if (next.desktopSessionId != null) {
+            lastDesktopBeatAt = Date.now();
+            void pushDesktopBeat(next.desktopSessionId, next.ms, nowPaused ? 'paused' : 'playing');
+          }
+        }
+        sendResponse({ success: true, active: true, control, paused: nowPaused });
+        return;
+      }
+      sendResponse({ success: true, active: true, control: null, paused: !!active.paused });
+    })();
+    return true;
+  }
+  if (request.action === 'immersionStats') {
+    (async () => {
+      const { active, days, sessions } = await getImmersionStore();
+      // A stats read is a natural moment to retry pending desktop
+      // pushes — the page re-reads on the storage change event.
+      void syncImmersionSessions();
+      sendResponse({ success: true, active, days, sessions });
+    })();
+    return true;
+  }
+  // Delete one logged session (stats page): out of the log, and its
+  // time handed back from the day totals. Local store only — a copy
+  // already mirrored into the desktop's study_sessions stays there
+  // (that log belongs to the desktop; it exposes no delete API).
+  if (request.action === 'immersionDeleteSession') {
+    (async () => {
+      const { days, sessions } = await getImmersionStore();
+      const result = removeSession(sessions, days, Number(request.start), Number(request.end));
+      if (!result) {
+        // Already gone (double-click, second stats tab) — deleting a
+        // deleted thing is success from the user's point of view.
+        sendResponse({ success: true });
+        return;
+      }
+      await chrome.storage.local.set({
+        [IMMERSION_DAYS_KEY]: result.days,
+        [IMMERSION_SESSIONS_KEY]: result.sessions,
+      });
+      sendResponse({ success: true });
     })();
     return true;
   }
@@ -944,18 +1640,145 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
     return true;
   }
 
+  // ── Watch-list probe: "is this URL on the Immersion list?" ──
+  // Paired → the desktop's /v1/media/lookup; unpaired → the in-browser
+  // library. Same answer shape either way so the content script
+  // doesn't care where the list lives.
+  if (request.action === 'mediaLookup') {
+    (async () => {
+      try {
+        await cacheReady;
+        const url = String(request.url || '');
+        if (!url) {
+          sendResponse({ success: false, error: 'No URL.' });
+          return;
+        }
+        if (LOCAL_API_TOKEN) {
+          const r = await tlocal.lookupMedia(
+            LOCAL_API_BASE,
+            LOCAL_API_TOKEN,
+            url,
+            LOCAL_WORKSPACE_ID ?? undefined,
+          );
+          sendResponse({
+            success: true,
+            source: 'desktop',
+            matched: r.matched,
+            item: r.item ?? null,
+          });
+          return;
+        }
+        const item = await lookupLocalLibrary(url);
+        sendResponse({ success: true, source: 'local', matched: !!item, item });
+      } catch (e) {
+        sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  // ── Library page data: unified list over desktop / in-browser ──
+  if (request.action === 'libraryList') {
+    (async () => {
+      try {
+        await cacheReady;
+        if (LOCAL_API_TOKEN && LOCAL_WORKSPACE_ID != null) {
+          const items = await tlocal.listMedia(
+            LOCAL_API_BASE,
+            LOCAL_API_TOKEN,
+            LOCAL_WORKSPACE_ID,
+            { limit: 200 },
+          );
+          sendResponse({ success: true, source: 'desktop', items });
+          return;
+        }
+        const items = await listLocalLibrary();
+        sendResponse({ success: true, source: 'local', items });
+      } catch (e) {
+        // Desktop paired but unreachable (app closed) — fall back to
+        // the local store rather than a dead page. It may be empty,
+        // but the page can say why.
+        try {
+          const items = await listLocalLibrary();
+          sendResponse({
+            success: true,
+            source: 'local',
+            items,
+            desktopError: e instanceof Error ? e.message : String(e),
+          });
+        } catch (e2) {
+          sendResponse({ success: false, error: e2 instanceof Error ? e2.message : String(e2) });
+        }
+      }
+    })();
+    return true;
+  }
+  if (request.action === 'libraryRemove') {
+    (async () => {
+      const removed = await removeLocalLibraryItem(String(request.id || ''));
+      sendResponse({ success: true, removed });
+    })();
+    return true;
+  }
+
   // ── Send to Tokori: YouTube video / generic URL → library item ──
   if (request.action === 'sendLibraryItem') {
     (async () => {
       const s = await getSettings();
-      const { kind, title, url, durationSec, source, thumbnailUrl } = request as {
+      const { kind, title, url, durationSec, source, thumbnailUrl, channel } = request as {
         kind: 'video' | 'article' | 'book' | 'podcast';
         title: string;
         url: string;
         durationSec?: number;
         source?: string;
         thumbnailUrl?: string;
+        /** Channel / creator name — becomes the item's author. */
+        channel?: string;
       };
+      // Watch/listen media prefers the paired desktop's Immersion list
+      // (`/v1/media`, desktop ≥ 2026-07) — that's where the progress
+      // beats land. Idempotent server-side, so a double-send is safe.
+      if (
+        (kind === 'video' || kind === 'podcast') &&
+        LOCAL_API_TOKEN &&
+        s.localWorkspaceId != null
+      ) {
+        try {
+          await cacheReady;
+          const item = await tlocal.createMediaItem(LOCAL_API_BASE, LOCAL_API_TOKEN, {
+            workspaceId: s.localWorkspaceId,
+            title,
+            url,
+            kind,
+            author: channel,
+            totalUnits: durationSec ? Math.ceil(durationSec / 60) : undefined,
+          });
+          sendResponse({ success: true, target: 'desktop', id: item.id });
+          return;
+        } catch (e) {
+          // An older desktop 404s here — fall through to the cloud
+          // target rather than dead-ending a paired user.
+          warn('local media create failed, trying cloud:', e);
+        }
+      }
+      // No desktop paired — the in-browser library (library.html) is
+      // the watch-list store. Cloud stays the fallback for the
+      // non-video kinds below only; mixing sources for videos would
+      // scatter the list across pages that can't see each other.
+      if (kind === 'video' || kind === 'podcast') {
+        try {
+          const { item, existed } = await addLocalLibraryItem({
+            url,
+            title,
+            channel: channel ?? source ?? null,
+            durationSec: durationSec ?? null,
+          });
+          sendResponse({ success: true, target: 'local', id: item.id, existed });
+        } catch (e) {
+          sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+        }
+        return;
+      }
       if (s.save.tokoriCloud && CLOUD_TOKEN && s.cloudWorkspaceId) {
         try {
           const r = await tcloud.createLibraryItem(CLOUD_API_BASE, CLOUD_TOKEN, {
@@ -977,7 +1800,7 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
       sendResponse({
         success: false,
         error:
-          'Send to Tokori library needs a signed-in cloud account in Settings (local IPC import is not yet supported).',
+          'Send to Tokori needs a paired desktop app (Settings → Desktop) or a signed-in cloud account.',
         errorCode: 'library_no_target',
       });
     })();
@@ -1132,6 +1955,138 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
     return true;
   }
 
+  // ── OCR a video-frame crop (burned-in subtitles) ──
+  //
+  // Engine per `settings.ocrEngine`:
+  //   'auto'  → the local tesseract model when its language pack is
+  //             downloaded (Options → AI → Local OCR), else BYO AI.
+  //   'local' → local model only — fully offline, no key.
+  //   'ai'    → BYO AI vision key only.
+  // The content-side sampler already rate-limits and only sends frames
+  // whose subtitle region visibly changed.
+  if (request.action === 'ocrImage') {
+    (async () => {
+      const s = await getSettings();
+      const lang = (request.lang as LanguageCode) || s.defaultTargetLang;
+      const dataUrl = String(request.dataUrl || '');
+      const engine = s.ocrEngine || 'auto';
+      const tessLang = tesseractLangFor(lang);
+      const localReady = !!tessLang && (s.ocrLocalLangs || []).includes(tessLang);
+
+      if (engine === 'local' || (engine === 'auto' && localReady)) {
+        try {
+          if (!tessLang) {
+            throw new Error(`No local OCR model available for "${lang}".`);
+          }
+          const r = await offscreenOcr({
+            type: 'tokori-local-ocr',
+            dataUrl,
+            tessLang,
+            prepared: !!request.prepared,
+          });
+          sendResponse({ success: true, text: r.text, confidence: r.confidence });
+          return;
+        } catch (e) {
+          if (engine === 'local') {
+            sendResponse({
+              success: false,
+              error: `Local OCR failed: ${e instanceof Error ? e.message : String(e)}`,
+            });
+            return;
+          }
+          warn('local OCR failed, falling back to AI:', e);
+        }
+      }
+
+      if (s.ai.provider === 'none' || !s.ai.apiKey) {
+        sendResponse({
+          success: false,
+          error:
+            'OCR needs the local model (Options → AI → Local OCR, one-time download) ' +
+            'or an AI key (Options → AI).',
+          errorCode: 'ocr_no_provider',
+        });
+        return;
+      }
+      const language = getLanguage(lang)?.name ?? lang;
+      try {
+        const r = await visionOnce({
+          provider: s.ai.provider,
+          apiKey: s.ai.apiKey,
+          model: s.ai.model,
+          system:
+            'You are an OCR engine for burned-in (hardcoded) video subtitles. ' +
+            'Read the subtitle text in the image and reply with ONLY that text — ' +
+            'no quotes, no markdown, no commentary. Preserve the original ' +
+            'characters exactly; if one subtitle wraps onto two lines, join them ' +
+            'with a single space. Ignore watermarks, logos, player UI, and ' +
+            'incidental scene text. If no subtitle text is visible, reply with ' +
+            'exactly: NONE',
+          user:
+            `The image is the bottom strip of a video frame. The subtitle is ` +
+            `expected to be in ${language} (transcribe whatever it actually says).`,
+          imageDataUrl: dataUrl,
+        });
+        const raw = r.text.trim();
+        sendResponse({ success: true, text: /^none[.!]?$/i.test(raw) ? '' : raw });
+      } catch (e) {
+        sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  // ── Local OCR warm-up (fired when OCR mode turns on) ──
+  // Spins the offscreen worker + cached model up ahead of the first
+  // frame so the first subtitle line doesn't pay the cold start. Only
+  // when the pack is already downloaded — a warm-up must never
+  // surprise the user with a 15 MB fetch.
+  if (request.action === 'ocrLocalWarmup') {
+    (async () => {
+      try {
+        const s = await getSettings();
+        const tessLang = tesseractLangFor(String(request.lang || s.defaultTargetLang));
+        if (!tessLang || !(s.ocrLocalLangs || []).includes(tessLang)) {
+          sendResponse({ success: false, error: 'Local model not downloaded.' });
+          return;
+        }
+        await offscreenOcr({ type: 'tokori-local-ocr-warmup', tessLang });
+        sendResponse({ success: true });
+      } catch (e) {
+        sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  // ── Local OCR model download (Options → AI → Local OCR) ──
+  // Spins the offscreen tesseract worker up for the language, which
+  // fetches + caches the pack in IndexedDB; on success the language is
+  // recorded in settings so 'auto' starts preferring the local engine.
+  if (request.action === 'ocrLocalDownload') {
+    (async () => {
+      try {
+        const tessLang = tesseractLangFor(String(request.lang || ''));
+        if (!tessLang) {
+          sendResponse({
+            success: false,
+            error: `No local OCR model is available for "${request.lang}" yet — the AI engine still works for it.`,
+          });
+          return;
+        }
+        await offscreenOcr({ type: 'tokori-local-ocr-warmup', tessLang });
+        const s = await getSettings();
+        const langs = new Set(s.ocrLocalLangs || []);
+        langs.add(tessLang);
+        await patchSettings({ ocrLocalLangs: [...langs] });
+        sendResponse({ success: true, tessLang });
+      } catch (e) {
+        sendResponse({ success: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
   // ── Translate ──
   //
   // Engine per `settings.translateEngine`:
@@ -1205,6 +2160,7 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
             ...input,
           });
           KNOWN_WORDS.set(word, r.status);
+          persistKnownWords();
           sendResponse({ success: true, id: r.id, status: r.status, via: 'desktop' });
           return;
         } catch (e) {
@@ -1219,6 +2175,7 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
             ...input,
           });
           KNOWN_WORDS.set(word, r.status);
+          persistKnownWords();
           sendResponse({ success: true, id: r.id, status: r.status, via: 'cloud' });
           return;
         } catch (e) {
@@ -1242,7 +2199,7 @@ chrome.runtime.onMessage.addListener((request: any, sender, sendResponse) => {
   if (request.action === 'getWordStatus') {
     (async () => {
       await cacheReady;
-      await ensureKnownWords();
+      await knownWordsReady();
       sendResponse({
         success: true,
         status: KNOWN_WORDS.get(request.word as string) ?? null,

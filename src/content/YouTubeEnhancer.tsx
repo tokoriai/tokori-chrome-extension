@@ -22,13 +22,17 @@
  *     the click bubbles through and triggers a dict lookup.
  *   • Position is stored as a `{ x, y }` offset *relative to the player
  *     centre* so it doesn't drift when the user resizes the window.
- *   • Target language selector + auto-translate fallback is in the
- *     toolbar; see youtube-cues.ts for the track-selection logic.
+ *   • The Subtitle-source menu lives in the toolbar. Auto only engages
+ *     when the video actually has a target-language caption track —
+ *     otherwise the extension stays hands-off (YouTube's own captions
+ *     run untouched) and the toolbar shows a "No <lang> CC" hint; see
+ *     youtube-cues.ts / lib/yt-track-pick for the selection ladder.
  */
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { TOKENS, s } from '../lib/theme';
-import { detectLanguage, getLanguage, LANGUAGES, type LanguageCode } from '../lib/languages';
+import { detectLanguage, getLanguage, type LanguageCode } from '../lib/languages';
 import { sendMsg, sendMsgAsync } from '../lib/chromeApi';
 import { type Token, tokenize, segmentText } from './youtube/caption-tokenize';
 import { CaptionSidebar } from './youtube/CaptionSidebar';
@@ -36,6 +40,12 @@ import { RubyWord } from './RubyWord';
 import { DEFAULT_CAPTION_STYLE, statusColorFor, type CaptionStyle } from './youtube/caption-style';
 import { CaptionSettingsPanel } from './youtube/CaptionSettingsPanel';
 import { registerMiningSource, type MiningSource } from '../lib/mining/source';
+import type { Settings } from '../lib/settings';
+import { useImmersionTimer } from './youtube/useImmersion';
+import { useOcrCues } from './ocr/useOcrCues';
+import { OcrRegionSelector } from './ocr/OcrRegionSelector';
+import { DEFAULT_OCR_REGION, normalizeOcrRegion, type OcrRegion } from '../lib/ocr-cues';
+import { formatTimer } from '../lib/immersion';
 
 interface Cue {
   start: number;
@@ -52,8 +62,21 @@ interface DragOffset {
 }
 
 const POS_STORAGE_KEY = 'youtubeCaptionOffset';
-const LANG_STORAGE_KEY = 'youtubeTargetLang';
+/** OCR mode gets its own drag offset — its bar sits opposite the
+ *  capture region by default (usually the TOP of the player, clear of
+ *  the burned-in text), and dragging it there must not relocate the
+ *  normal caption overlay. */
+const OCR_POS_STORAGE_KEY = 'youtubeCaptionOffsetOcr';
+/** User-drawn OCR capture region (frame fractions). */
+const OCR_REGION_KEY = 'youtubeOcrRegion';
+/** Retired: the toolbar's per-video CC language picker persisted here.
+ *  Removed from storage on mount so it can never shadow the settings
+ *  value (Options → General) again. */
+const LEGACY_LANG_STORAGE_KEY = 'youtubeTargetLang';
+/** Legacy boolean (blur on/off) — migrated into EN_MODE_KEY below. */
 const BLUR_TRANSLATED_KEY = 'youtubeBlurTranslated';
+/** 'show' | 'blur' | 'off' — the EN line's display mode. */
+const EN_MODE_KEY = 'youtubeEnMode';
 const STYLE_STORAGE_KEY = 'youtubeCaptionStyle';
 const SIDEBAR_OPEN_KEY = 'youtubeSidebarOpen';
 const NATIVE_CC_HIDE_STYLE_ID = 'tokori-yt-hide-native-cc';
@@ -62,6 +85,10 @@ const DRAG_THRESHOLD_PX = 4;
 /** Rough Han / kana test — only tokens containing these scripts get a
  *  ruby reading lookup; Latin words inside a zh/ja cue never will. */
 const CJK_TOKEN_RE = /[㐀-鿿豈-﫿぀-ヿ]/;
+
+/** Stable empty cue list for the EN-off mode (identity matters — the
+ *  RAF loop re-arms on cue-list changes). */
+const NO_CUES: Cue[] = [];
 
 export function YouTubeEnhancer() {
   const [native, setNative] = useState<Cue[]>([]);
@@ -91,14 +118,72 @@ export function YouTubeEnhancer() {
    *  line is unblurred. Resets to null on every new cue so the user
    *  reads native first each time. */
   const [revealedCueStart, setRevealedCueStart] = useState<number | null>(null);
-  /** User-controlled master toggle. Persisted so the choice survives
-   *  refreshes. Defaults to ON — the whole point of the feature is to
-   *  force native-first reading. */
-  const [blurTranslated, setBlurTranslated] = useState<boolean>(true);
+  /** The EN (display-language) line, user-controlled and persisted:
+   *   • 'blur' — rendered blurred, click to reveal (default: forces
+   *              native-first reading).
+   *   • 'show' — always readable.
+   *   • 'off'  — no EN line AT ALL: nothing rendered, no translate
+   *              calls in OCR mode, and the MAIN world skips the
+   *              translated-track hunting entirely. */
+  const [enMode, setEnMode] = useState<'show' | 'blur' | 'off'>('blur');
+  const blurTranslated = enMode === 'blur';
   /** Caption styling (font sizes + colours). Tweakable from the gear
    *  icon; persisted under STYLE_STORAGE_KEY. */
   const [captionStyle, setCaptionStyle] = useState<CaptionStyle>(DEFAULT_CAPTION_STYLE);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Watch-list wiring: the canonical URL of the current watch page
+   *  and whether it's on the paired desktop's Immersion list. 'hidden'
+   *  = unpaired desktop / no watch page — no dead affordance. */
+  const [watchUrl, setWatchUrl] = useState<string | null>(null);
+  const [listState, setListState] = useState<'hidden' | 'out' | 'busy' | 'in'>('hidden');
+  const [listError, setListError] = useState<string | null>(null);
+  /** Immersion timer (study mode) — explicit start via the ⏱ pill;
+   *  accrues only while a LIBRARY video actually plays (the second arg
+   *  gates accrual on the watch-list lookup). See useImmersion.ts.
+   *  A session ended from the desktop sidebar counts as a manual stop
+   *  for THIS video, so the listed-video auto-start below doesn't
+   *  immediately resurrect what the user just ended. Declared here
+   *  (not at the toggle) because the remote-end callback writes it. */
+  const manualStopUrlRef = useRef<string | null>(null);
+  const watchUrlRef = useRef<string | null>(null);
+  watchUrlRef.current = watchUrl;
+  const onRemoteEnd = useCallback(() => {
+    manualStopUrlRef.current = watchUrlRef.current;
+  }, []);
+  const immersion = useImmersionTimer(isYouTube, listState === 'in', onRemoteEnd);
+  /** Timer running but the current video isn't on the library — the
+   *  session is alive, just not counting. Drives the pill hint. */
+  const timerIdle = immersion.active && listState !== 'in';
+  /** Session alive but paused (video paused, or paused from the
+   *  desktop sidebar) — frozen clock, amber pill. */
+  const timerPaused = immersion.active && !timerIdle && immersion.paused;
+  /** This video's caption tracks + auto-translate languages (published
+   *  by the MAIN-world script) — feeds the YouTube-CC-menu-style
+   *  subtitle select next to the language picker. */
+  const [ccTracks, setCcTracks] = useState<{
+    tracks: { vssId: string; languageCode: string; kind: string; label: string }[];
+    translations: { code: string; name: string }[];
+  }>({ tracks: [], translations: [] });
+  /** 'auto' | 'track:<vssId>' | 'tlang:<code>' | 'ocr' — mirrors the
+   *  MAIN world's native-line override (reset to auto on navigation).
+   *  'ocr' suspends the MAIN world entirely and reads burned-in
+   *  subtitles off the frame instead. */
+  const [trackChoice, setTrackChoice] = useState('auto');
+  /** False once the MAIN world reports it is standing down on this
+   *  video (`tokori-yt-track-status`, engaged:false — no caption track
+   *  in the target language). Auto then leaves YouTube's captions
+   *  alone: the toolbar stops pinning itself as "loading" and shows a
+   *  hint instead. Any user pick (or new video / target) re-engages. */
+  const [autoEngaged, setAutoEngaged] = useState(true);
+  const lastTracksVideoRef = useRef('');
+  /** Latest tracks, readable synchronously from event handlers — the
+   *  `tokori-yt-tracks` and `tokori-yt-auto-pick` events land in the
+   *  same task, before React commits the state update above. */
+  const ccTracksRef = useRef(ccTracks);
+  /** True while `trackChoice` is the automatic pick or a reflection of
+   *  it (not a user pin) — only then may `tokori-yt-auto-pick` move the
+   *  Subtitle select. A ref for the same same-task reason. */
+  const trackAdoptableRef = useRef(true);
   /** Caption sidebar (full transcript with jump / mine / lookup).
    *  Persisted so it survives navigation within YouTube. */
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -111,6 +196,51 @@ export function YouTubeEnhancer() {
   // overlay doesn't render anything until the MAIN script reports a
   // first reading — avoids a flash of overlay before YT decides.
   const [ccEnabled, setCcEnabled] = useState<boolean | null>(null);
+  /** The player has no usable CC control at all (video without caption
+   *  tracks — the OCR mode's home turf). The toolbar then reveals on
+   *  hover only, instead of floating permanently over every video. */
+  const [ccAbsent, setCcAbsent] = useState(false);
+  /** Burned-in subtitle capture (player-bar OCR button / Subtitle menu
+   *  → OCR). While it owns the overlay, the cue lists below come from
+   *  frame OCR instead of the timedtext streams. Deliberately NOT
+   *  gated on YouTube's CC button — burned-subs videos are exactly
+   *  where the user keeps YT captions off. */
+  const ocrMode = trackChoice === 'ocr';
+  /** Where on the frame to read. `null` until the user has ever drawn
+   *  one — that first enable auto-opens the region selector. */
+  const [ocrRegion, setOcrRegion] = useState<OcrRegion | null>(null);
+  const [selectingRegion, setSelectingRegion] = useState(false);
+  /** OCR-mode drag offset (separate persistence — see the key above). */
+  const [ocrOffset, setOcrOffset] = useState<DragOffset | null>(null);
+  const ocr = useOcrCues(
+    isYouTube && ocrMode,
+    targetLang,
+    ocrRegion ?? DEFAULT_OCR_REGION,
+    enMode !== 'off',
+    '#movie_player video',
+  );
+  const nativeCues = ocrMode ? ocr.native : native;
+  // EN off hides the translated stream EVERYWHERE (overlay line, RAF
+  // actives, sidebar, mining) while keeping the loaded cues in state —
+  // flipping back on is instant. Stable [] so effects keyed on the
+  // list don't re-arm each render.
+  const translatedCues = enMode === 'off' ? NO_CUES : ocrMode ? ocr.translated : translated;
+
+  const saveOcrRegion = (r: OcrRegion) => {
+    setOcrRegion(r);
+    setSelectingRegion(false);
+    try {
+      chrome.storage.local.set({ [OCR_REGION_KEY]: r });
+    } catch {}
+  };
+
+  // First-ever OCR enable: ask WHERE the subtitles are before burning
+  // vision calls on the wrong strip. Esc keeps the default bottom
+  // strip for this session; the ⛶ Region chip reopens the selector.
+  useEffect(() => {
+    if (ocrMode && ocrRegion === null) setSelectingRegion(true);
+    if (!ocrMode) setSelectingRegion(false);
+  }, [ocrMode, ocrRegion]);
   // Player rect (viewport-relative). Updated each animation frame so
   // the overlay tracks resize / theater / fullscreen instantly.
   const [playerRect, setPlayerRect] = useState<DOMRect | null>(null);
@@ -144,27 +274,41 @@ export function YouTubeEnhancer() {
   }, []);
 
   // ── Persisted prefs ─────────────────────────────────────────────
+  // The target language comes from the extension settings (Options →
+  // General; onboarding sets it from the paired workspace). There is
+  // deliberately no per-video language picker anymore — the Subtitle menu
+  // (the video's own caption tracks) is the only caption-source
+  // control, and the auto pick + dictionary follow the settings value.
   useEffect(() => {
     if (!isYouTube) return;
     try {
-      chrome.storage.local.get([POS_STORAGE_KEY, LANG_STORAGE_KEY], (r) => {
+      chrome.storage.local.get([POS_STORAGE_KEY, OCR_POS_STORAGE_KEY, OCR_REGION_KEY], (r) => {
         const p = r[POS_STORAGE_KEY] as DragOffset | undefined;
         if (p && Number.isFinite(p.dx) && Number.isFinite(p.dy)) setOffset(p);
-        const stored = r[LANG_STORAGE_KEY] as LanguageCode | undefined;
-        if (stored) setTargetLang(stored);
-        else {
-          sendMsg<{ data: { defaultTargetLang: LanguageCode } }>(
-            { action: 'getSettings' },
-            (res) => {
-              if (res?.success) {
-                const lang = (res as { data?: { defaultTargetLang?: LanguageCode } }).data
-                  ?.defaultTargetLang;
-                if (lang) setTargetLang(lang);
-              }
-            },
-          );
+        const po = r[OCR_POS_STORAGE_KEY] as DragOffset | undefined;
+        if (po && Number.isFinite(po.dx) && Number.isFinite(po.dy)) setOcrOffset(po);
+        if (r[OCR_REGION_KEY]) setOcrRegion(normalizeOcrRegion(r[OCR_REGION_KEY]));
+      });
+      // One-time cleanup: the retired toolbar picker used to shadow the
+      // settings value through this key.
+      chrome.storage.local.remove(LEGACY_LANG_STORAGE_KEY);
+      sendMsg<{ data: { defaultTargetLang: LanguageCode } }>({ action: 'getSettings' }, (res) => {
+        if (res?.success) {
+          const lang = (res as { data?: { defaultTargetLang?: LanguageCode } }).data
+            ?.defaultTargetLang;
+          if (lang) applyTargetLang(lang);
         }
       });
+      // Settings are a flat spread in chrome.storage.local, so an
+      // Options change surfaces here — open YouTube tabs follow along
+      // without a reload.
+      const onChanged = (changes: Record<string, { newValue?: unknown }>, area: string): void => {
+        if (area !== 'local' || !('defaultTargetLang' in changes)) return;
+        const lang = changes.defaultTargetLang?.newValue as LanguageCode | undefined;
+        if (lang) applyTargetLang(lang);
+      };
+      chrome.storage.onChanged.addListener(onChanged);
+      return () => chrome.storage.onChanged.removeListener(onChanged);
     } catch {
       /* extension context invalidated — leave default */
     }
@@ -199,9 +343,14 @@ export function YouTubeEnhancer() {
       setKnownWords(next);
     }
     void loadKnown();
-    const t = window.setInterval(loadKnown, 30_000);
-    // Fired by the dict popup right after a status grade / save so the
-    // caption colours update immediately instead of on the next poll.
+    // Slow safety-net poll only: real updates arrive as the window
+    // event below (relayed from the background's storage-snapshot push
+    // by content/index.tsx), and each poll is answered from the
+    // worker's in-memory map without a network hit anyway.
+    const t = window.setInterval(loadKnown, 300_000);
+    // Fired by the dict popup right after a status grade / save — and
+    // by the storage push relay — so caption colours update
+    // immediately instead of on the next poll.
     const onChanged = () => void loadKnown();
     window.addEventListener('tokori-known-words-changed', onChanged);
     return () => {
@@ -211,19 +360,42 @@ export function YouTubeEnhancer() {
     };
   }, [isYouTube]);
 
-  // ── Persisted blur-translated toggle ───────────────────────────
+  // ── Persisted EN-line mode ─────────────────────────────────────
   useEffect(() => {
     if (!isYouTube) return;
     try {
-      chrome.storage.local.get([BLUR_TRANSLATED_KEY, SIDEBAR_OPEN_KEY], (r) => {
-        const v = r[BLUR_TRANSLATED_KEY];
-        if (typeof v === 'boolean') setBlurTranslated(v);
+      chrome.storage.local.get([EN_MODE_KEY, BLUR_TRANSLATED_KEY, SIDEBAR_OPEN_KEY], (r) => {
+        const mode = r[EN_MODE_KEY];
+        if (mode === 'show' || mode === 'blur' || mode === 'off') {
+          setEnMode(mode);
+        } else if (typeof r[BLUR_TRANSLATED_KEY] === 'boolean') {
+          // Migrate the old blur on/off boolean.
+          setEnMode(r[BLUR_TRANSLATED_KEY] ? 'blur' : 'show');
+        }
         if (typeof r[SIDEBAR_OPEN_KEY] === 'boolean') setSidebarOpen(r[SIDEBAR_OPEN_KEY]);
       });
     } catch {
       /* extension context invalidated — keep default */
     }
   }, [isYouTube]);
+
+  const cycleEnMode = () => {
+    const next = enMode === 'show' ? 'blur' : enMode === 'blur' ? 'off' : 'show';
+    setEnMode(next);
+    if (next !== 'blur') setRevealedCueStart(null);
+    try {
+      chrome.storage.local.set({ [EN_MODE_KEY]: next });
+    } catch {}
+  };
+
+  // Tell the MAIN world whether to hunt the translated track at all —
+  // EN off skips its excursions (the flicker-prone, fetch-heavy part).
+  useEffect(() => {
+    if (!isYouTube) return;
+    window.dispatchEvent(
+      new CustomEvent('tokori-yt-set-translation', { detail: { enabled: enMode !== 'off' } }),
+    );
+  }, [isYouTube, enMode]);
 
   const toggleSidebar = (v: boolean) => {
     setSidebarOpen(v);
@@ -288,7 +460,7 @@ export function YouTubeEnhancer() {
   // native CC reappears for any other consumer.
   useEffect(() => {
     if (!isYouTube) return;
-    const haveCues = native.length > 0 || translated.length > 0;
+    const haveCues = nativeCues.length > 0 || translatedCues.length > 0;
     const overlayActive = haveCues && ccEnabled !== false;
     const existing = document.getElementById(NATIVE_CC_HIDE_STYLE_ID);
     if (!overlayActive) {
@@ -305,30 +477,133 @@ export function YouTubeEnhancer() {
       `;
       (document.head || document.documentElement).appendChild(style);
     }
-  }, [isYouTube, native.length, translated.length, ccEnabled]);
+  }, [isYouTube, nativeCues.length, translatedCues.length, ccEnabled]);
 
   // ── Cue ingest + CC-state mirror ───────────────────────────────
   useEffect(() => {
     if (!isYouTube) return;
+    // Cue events are stamped with the video id they were captured for —
+    // ignore any that don't match the page we're on (a dispatch racing
+    // a navigation). The MAIN world already drops mismatched responses;
+    // this guards the listener side of the same race.
+    const cuesMatchPage = (videoId: string | undefined) => {
+      const cur = new URLSearchParams(window.location.search).get('v');
+      return !videoId || !cur || videoId === cur;
+    };
     const onNative = (e: Event) => {
-      const ce = e as CustomEvent<{ cues: Cue[] }>;
-      if (ce.detail?.cues) setNative(ce.detail.cues);
+      const ce = e as CustomEvent<{ cues: Cue[]; videoId?: string }>;
+      if (ce.detail?.cues && cuesMatchPage(ce.detail.videoId)) {
+        setNative(ce.detail.cues);
+        // Native cues flowing = the MAIN world owns this video after all.
+        setAutoEngaged(true);
+      }
     };
     const onTranslated = (e: Event) => {
-      const ce = e as CustomEvent<{ cues: Cue[] }>;
-      if (ce.detail?.cues) setTranslated(ce.detail.cues);
+      const ce = e as CustomEvent<{ cues: Cue[]; videoId?: string }>;
+      if (ce.detail?.cues && cuesMatchPage(ce.detail.videoId)) setTranslated(ce.detail.cues);
     };
     const onCcState = (e: Event) => {
-      const ce = e as CustomEvent<{ enabled: boolean }>;
+      const ce = e as CustomEvent<{ enabled: boolean; absent?: boolean }>;
       setCcEnabled(!!ce.detail?.enabled);
+      setCcAbsent(!!ce.detail?.absent);
+    };
+    // The MAIN world stood down (no target-language track): drop any
+    // cue state that slipped in before the verdict, so the overlay
+    // never hides YouTube's own captions while rendering nothing.
+    const onTrackStatus = (e: Event) => {
+      const ce = e as CustomEvent<{ videoId?: string; engaged?: boolean }>;
+      if (!cuesMatchPage(ce.detail?.videoId) || ce.detail?.engaged !== false) return;
+      setAutoEngaged(false);
+      setNative([]);
+      setTranslated([]);
+      setActiveNative(null);
+      setActiveTranslated(null);
+      lastNativeRef.current = null;
+      lastTranslatedRef.current = null;
+    };
+    const onTracks = (e: Event) => {
+      const ce = e as CustomEvent<{
+        videoId?: string;
+        tracks?: { vssId: string; languageCode: string; kind: string; label: string }[];
+        translationLanguages?: { code: string; name: string }[];
+      }>;
+      const next = {
+        tracks: ce.detail?.tracks || [],
+        translations: ce.detail?.translationLanguages || [],
+      };
+      ccTracksRef.current = next;
+      setCcTracks(next);
+      // New video → the MAIN world reset its override to auto; mirror
+      // that here so the select doesn't claim a pin that's gone.
+      const vid = ce.detail?.videoId || '';
+      if (vid && vid !== lastTracksVideoRef.current) {
+        lastTracksVideoRef.current = vid;
+        setTrackChoice('auto');
+        trackAdoptableRef.current = true;
+      }
+    };
+    // The automatic pick resolved (target-language track, zh script
+    // handling, auto-translate fallback) — land the Subtitle select on
+    // that entry so it reads "Japanese (auto-generated)" instead of
+    // "Auto". Display-only: no pin is dispatched, so the MAIN world
+    // keeps its auto-mode fallbacks. Skipped while the user holds an
+    // explicit pin (or OCR).
+    const onAutoPick = (e: Event) => {
+      const ce = e as CustomEvent<{ videoId?: string; value?: string }>;
+      const value = ce.detail?.value || '';
+      if (!value || !cuesMatchPage(ce.detail?.videoId) || !trackAdoptableRef.current) return;
+      // Only reflect entries the menu actually offers — an unlisted
+      // value would render the select blank.
+      const { tracks, translations } = ccTracksRef.current;
+      const listed = value.startsWith('tlang:')
+        ? translations.some((l) => `tlang:${l.code}` === value)
+        : tracks.some((t) => `track:${t.vssId}` === value);
+      if (listed) setTrackChoice(value);
+    };
+    // The user picked a track / auto-translate language in YOUTUBE's own
+    // subtitles menu and the MAIN world adopted it as a pin. Follow it
+    // like a pick from our menu, minus the set-track echo: move the
+    // select, mark it a user pin, and clear cue state so the new source
+    // repopulates cleanly (the fresh selection round refetches it).
+    const onExternalPick = (e: Event) => {
+      const ce = e as CustomEvent<{ videoId?: string; value?: string }>;
+      const value = ce.detail?.value || '';
+      if (!value || !cuesMatchPage(ce.detail?.videoId)) return;
+      const { tracks, translations } = ccTracksRef.current;
+      const listed = value.startsWith('tlang:')
+        ? translations.some((l) => `tlang:${l.code}` === value)
+        : tracks.some((t) => `track:${t.vssId}` === value);
+      if (!listed) return;
+      trackAdoptableRef.current = false;
+      setTrackChoice(value);
+      setNative([]);
+      setTranslated([]);
+      setActiveNative(null);
+      setActiveTranslated(null);
+      lastNativeRef.current = null;
+      lastTranslatedRef.current = null;
     };
     window.addEventListener('tokori-yt-native-cues', onNative as EventListener);
     window.addEventListener('tokori-yt-translated-cues', onTranslated as EventListener);
     window.addEventListener('tokori-yt-cc-state', onCcState as EventListener);
+    window.addEventListener('tokori-yt-track-status', onTrackStatus as EventListener);
+    window.addEventListener('tokori-yt-tracks', onTracks as EventListener);
+    window.addEventListener('tokori-yt-auto-pick', onAutoPick as EventListener);
+    window.addEventListener('tokori-yt-external-pick', onExternalPick as EventListener);
+    // The MAIN-world script runs at document_start and may have already
+    // captured + dispatched this video's tracks / cues before these
+    // listeners existed (this component mounts at document_idle, after a
+    // React commit). Ask it to re-serve whatever it has, so a caption
+    // round that finished early isn't lost to "sometimes no subtitles".
+    window.dispatchEvent(new CustomEvent('tokori-yt-request-replay'));
     return () => {
       window.removeEventListener('tokori-yt-native-cues', onNative as EventListener);
       window.removeEventListener('tokori-yt-translated-cues', onTranslated as EventListener);
       window.removeEventListener('tokori-yt-cc-state', onCcState as EventListener);
+      window.removeEventListener('tokori-yt-track-status', onTrackStatus as EventListener);
+      window.removeEventListener('tokori-yt-tracks', onTracks as EventListener);
+      window.removeEventListener('tokori-yt-auto-pick', onAutoPick as EventListener);
+      window.removeEventListener('tokori-yt-external-pick', onExternalPick as EventListener);
     };
   }, [isYouTube]);
 
@@ -357,8 +632,8 @@ export function YouTubeEnhancer() {
       }
       if (video) {
         const t = video.currentTime;
-        const n = findCue(native, t);
-        const tr = findCue(translated, t);
+        const n = findCue(nativeCues, t);
+        const tr = findCue(translatedCues, t);
         setActiveNative(n);
         setActiveTranslated(tr);
         if (n) lastNativeRef.current = n;
@@ -376,7 +651,7 @@ export function YouTubeEnhancer() {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [isYouTube, native, translated]);
+  }, [isYouTube, nativeCues, translatedCues]);
 
   // ── Register the MiningSource ──────────────────────────────────
   // The mining modal reads `window.__tokoriMiningSource()` to grab the
@@ -428,7 +703,304 @@ export function YouTubeEnhancer() {
     return dereg;
   }, [isYouTube, targetLang]);
 
+  // Watch-list state for the current video: recompute the canonical
+  // watch URL on SPA navigation, then probe the paired desktop's
+  // Immersion list ("is this queued?") to badge the toolbar. Unpaired
+  // or non-watch pages keep the button hidden.
+  useEffect(() => {
+    if (!isYouTube) return;
+    const compute = () => {
+      const v = new URL(window.location.href).searchParams.get('v');
+      setWatchUrl((prev) => {
+        const next = v ? `https://www.youtube.com/watch?v=${v}` : null;
+        return prev === next ? prev : next;
+      });
+    };
+    compute();
+    // yt-navigate-finish is the fast path; the 1 s poll catches
+    // navigations where the event is missed (same fallback the
+    // MAIN-world cue script uses).
+    const timer = window.setInterval(compute, 1000);
+    window.addEventListener('yt-navigate-finish', compute);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('yt-navigate-finish', compute);
+    };
+  }, [isYouTube]);
+
+  // ── Video-change reset ─────────────────────────────────────────
+  // The enhancer stays mounted across YouTube's SPA navigation, so a
+  // video switch must explicitly drop the previous video's captions —
+  // otherwise the RAF loop keeps matching the OLD transcript against
+  // the NEW video's clock until fresh cues arrive (or forever, when
+  // the new video has none). Only a real id→id change clears: going
+  // watch → home → back to the same video keeps the cues, because the
+  // MAIN world's once-flags still stand for that video and it won't
+  // re-dispatch them.
+  const lastVideoIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const vid = watchUrl ? new URL(watchUrl).searchParams.get('v') : null;
+    if (!vid) return;
+    if (lastVideoIdRef.current !== null && lastVideoIdRef.current !== vid) {
+      setNative([]);
+      setTranslated([]);
+      setActiveNative(null);
+      setActiveTranslated(null);
+      lastNativeRef.current = null;
+      lastTranslatedRef.current = null;
+      setRevealedCueStart(null);
+      // The subtitle menu belongs to the previous video too — it
+      // refills from the fresh `tokori-yt-tracks` publish.
+      setCcTracks({ tracks: [], translations: [] });
+      ccTracksRef.current = { tracks: [], translations: [] };
+      setTrackChoice('auto');
+      trackAdoptableRef.current = true;
+      // Fresh video, fresh verdict — the MAIN world re-announces
+      // hands-off if the new video lacks the target language too.
+      setAutoEngaged(true);
+    }
+    lastVideoIdRef.current = vid;
+  }, [watchUrl]);
+
+  useEffect(() => {
+    if (!watchUrl) {
+      setListState('hidden');
+      return;
+    }
+    let cancelled = false;
+    setListState('hidden');
+    setListError(null);
+    sendMsg({ action: 'mediaLookup', url: watchUrl }, (res) => {
+      if (cancelled) return;
+      const r = res as unknown as { success?: boolean; matched?: boolean } | undefined;
+      if (r?.success) setListState(r.matched ? 'in' : 'out');
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [watchUrl]);
+
+  const addToWatchList = useCallback(() => {
+    if (!watchUrl || listState === 'busy' || listState === 'in') return;
+    setListState('busy');
+    setListError(null);
+    const video = document.querySelector<HTMLVideoElement>('#movie_player video');
+    sendMsg(
+      {
+        action: 'sendLibraryItem',
+        kind: 'video',
+        title:
+          document.querySelector<HTMLElement>('#title h1, h1.title')?.innerText?.trim() ||
+          document.title.replace(/\s*-\s*YouTube\s*$/, '').trim(),
+        url: watchUrl,
+        durationSec:
+          video && Number.isFinite(video.duration) ? Math.round(video.duration) : undefined,
+        channel: scrapeChannelName(),
+      },
+      (res) => {
+        const r = res as unknown as { success?: boolean; error?: string } | undefined;
+        if (r?.success) {
+          setListState('in');
+        } else {
+          setListState('out');
+          setListError(r?.error || 'Could not reach Tokori.');
+        }
+      },
+    );
+  }, [watchUrl, listState]);
+
+  /** Timer toggle that remembers a manual stop, so the listed-video
+   *  auto-start below doesn't immediately restart what the user just
+   *  turned off. Navigating to another video clears the suppression.
+   *  (`manualStopUrlRef` lives up by the immersion hook — the desktop
+   *  remote-end callback shares it.) */
+  const toggleTimer = useCallback(() => {
+    manualStopUrlRef.current = immersion.active ? watchUrl : null;
+    immersion.toggle();
+  }, [immersion, watchUrl]);
+
+  // Auto-start the immersion timer when the current video is on the
+  // watch library (listState 'in' covers both the paired desktop and
+  // the in-browser store). Adding the video to the list was the
+  // opt-in; the timer — and with it progress tracking — then takes
+  // care of itself. Guarded per-URL so it fires once per video, and
+  // suppressed after a manual stop on the same video.
+  const autoStartedUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (listState !== 'in' || !watchUrl || immersion.active) return;
+    if (autoStartedUrlRef.current === watchUrl) return;
+    if (manualStopUrlRef.current === watchUrl) return;
+    let cancelled = false;
+    sendMsg({ action: 'getSettings' }, (res) => {
+      if (cancelled || !res?.success) return;
+      const s = (res as unknown as { data?: Settings }).data;
+      if (s?.immersion?.autoStartListed === false) return;
+      if (autoStartedUrlRef.current === watchUrl || manualStopUrlRef.current === watchUrl) return;
+      autoStartedUrlRef.current = watchUrl;
+      immersion.toggle();
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listState, watchUrl, immersion.active]);
+
+  // ── Native action-bar buttons (next to like / Share) ─────────────
+  //
+  // A host container is appended into YouTube's own actions row and
+  // the buttons render into it through a portal, so they live in the
+  // page layout (always visible) while their state stays in this
+  // component. YT rebuilds that row on SPA navigation and on layout
+  // experiments — the attach loop re-finds/re-creates the container
+  // instead of assuming it survives.
+  const [actionBarEl, setActionBarEl] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!isYouTube) return;
+    let cancelled = false;
+    const ensure = () => {
+      if (cancelled) return;
+      if (!/[?&]v=/.test(window.location.search)) {
+        setActionBarEl(null);
+        return;
+      }
+      const host =
+        document.querySelector<HTMLElement>(
+          'ytd-watch-metadata #actions #top-level-buttons-computed',
+        ) ?? document.querySelector<HTMLElement>('#actions #top-level-buttons-computed');
+      if (!host) {
+        setActionBarEl(null);
+        return;
+      }
+      let el = host.querySelector<HTMLElement>(':scope > #tokori-yt-actions');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'tokori-yt-actions';
+        el.style.display = 'inline-flex';
+        el.style.alignItems = 'center';
+        el.style.gap = '8px';
+        el.style.marginLeft = '8px';
+        host.appendChild(el);
+      }
+      setActionBarEl((prev) => (prev === el ? prev : el));
+    };
+    ensure();
+    const timer = window.setInterval(ensure, 1500);
+    window.addEventListener('yt-navigate-finish', ensure);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('yt-navigate-finish', ensure);
+      document.getElementById('tokori-yt-actions')?.remove();
+      setActionBarEl(null);
+    };
+  }, [isYouTube]);
+
+  // ── Player-bar OCR button (next to YouTube's own CC button) ─────
+  //
+  // A native-looking `.ytp-button` in the player controls toggles OCR
+  // mode — the discoverable entry point the Subtitle menu option can't
+  // be (the toolbar hides on caption-less videos until hovered). YT
+  // rebuilds the control bar on navigation, so the attach loop
+  // re-creates the button rather than assuming it survives.
+  const trackChoiceRef = useRef(trackChoice);
+  trackChoiceRef.current = trackChoice;
+  const changeTrackChoiceRef = useRef<(v: string) => void>(() => {});
+  changeTrackChoiceRef.current = changeTrackChoice;
+  useEffect(() => {
+    if (!isYouTube) return;
+    let cancelled = false;
+    const syncStyle = (btn: HTMLButtonElement) => {
+      const on = trackChoiceRef.current === 'ocr';
+      btn.setAttribute('aria-pressed', String(on));
+      // Mimic the red underline YT's CC button shows while pressed.
+      btn.style.boxShadow = on ? 'inset 0 -3px 0 #f00' : 'none';
+      btn.style.opacity = on ? '1' : '0.85';
+      btn.title = on
+        ? 'Tokori OCR captions: on — reading burned-in subtitles (click to turn off)'
+        : 'Tokori OCR captions: read burned-in (hardcoded) subtitles — local model or AI key (Options → AI)';
+    };
+    const ensure = () => {
+      if (cancelled) return;
+      // A control bar mid-rebuild or an unexpected layout variant must
+      // never throw out of this effect — the first call runs inside
+      // the React commit, and an exception there unmounts the WHOLE
+      // extension tree on the page. The 1.5 s tick simply retries.
+      try {
+        const existing = document.getElementById('tokori-ocr-ytp-btn') as HTMLButtonElement | null;
+        // Player pages only: /watch?v=… and the /live/<id> path live
+        // streams are opened under (no ?v= there — the old search-only
+        // gate silently kept the button off every live stream). Home /
+        // browse pages keep an inline preview #movie_player around, so
+        // the gate can't just be "a player exists".
+        if (!/[?&]v=/.test(window.location.search) && !/^\/live\//.test(window.location.pathname)) {
+          existing?.remove();
+          return;
+        }
+        const controls = document.querySelector<HTMLElement>('#movie_player .ytp-right-controls');
+        if (!controls) return;
+        let btn = existing;
+        if (!btn || !controls.contains(btn)) {
+          btn?.remove();
+          btn = document.createElement('button');
+          btn.id = 'tokori-ocr-ytp-btn';
+          btn.className = 'ytp-button';
+          btn.textContent = 'OCR';
+          btn.setAttribute('aria-label', 'Tokori OCR captions');
+          // Text-only button among YT's SVG icon buttons: left to the
+          // inline-block baseline (and the control bar's inherited
+          // line-height) the label sits visibly off the row. Flex-center
+          // the label and pin the box to the line top — every
+          // .ytp-button is full-height, so top means flush.
+          btn.style.cssText =
+            'display:inline-flex;align-items:center;justify-content:center;' +
+            'vertical-align:top;line-height:normal;' +
+            'font-size:12px;font-weight:700;letter-spacing:0.5px;';
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            changeTrackChoiceRef.current(trackChoiceRef.current === 'ocr' ? 'auto' : 'ocr');
+          });
+          // Right beside the CC button when it exists (even hidden),
+          // else lead the right-hand control cluster. Some YT layouts
+          // nest the CC button inside a wrapper — insertBefore needs a
+          // DIRECT child of `controls`, so climb up to that first (the
+          // playlist layout ships nested and used to throw here).
+          const ccBtn = controls.querySelector('.ytp-subtitles-button');
+          let anchor: Element | null = ccBtn;
+          while (anchor && anchor.parentElement !== controls) anchor = anchor.parentElement;
+          controls.insertBefore(btn, anchor ?? controls.firstChild);
+        }
+        syncStyle(btn);
+      } catch {
+        /* retried by the next tick */
+      }
+    };
+    ensure();
+    const timer = window.setInterval(ensure, 1500);
+    window.addEventListener('yt-navigate-finish', ensure);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('yt-navigate-finish', ensure);
+      document.getElementById('tokori-ocr-ytp-btn')?.remove();
+    };
+  }, [isYouTube]);
+
+  // Reflect a Subtitle-menu change on the player-bar button immediately
+  // (the attach loop above would catch it 1.5s later).
+  useEffect(() => {
+    const btn = document.getElementById('tokori-ocr-ytp-btn') as HTMLButtonElement | null;
+    if (!btn) return;
+    const on = trackChoice === 'ocr';
+    btn.setAttribute('aria-pressed', String(on));
+    btn.style.boxShadow = on ? 'inset 0 -3px 0 #f00' : 'none';
+    btn.style.opacity = on ? '1' : '0.85';
+  }, [trackChoice]);
+
   // ── Drag-anywhere ──────────────────────────────────────────────
+  // OCR mode drags (and persists) its own offset — the OCR bar lives
+  // at the opposite side of the player from the capture region, and
+  // repositioning it must not move the normal caption overlay.
+  const activeOffset = ocrMode ? ocrOffset : offset;
   const onContainerMouseDown = useCallback(
     (e: React.MouseEvent) => {
       // Allow native interaction on form controls.
@@ -438,8 +1010,10 @@ export function YouTubeEnhancer() {
       dragRef.current.moved = false;
       const startX = e.clientX;
       const startY = e.clientY;
-      const origDx = offset?.dx ?? 0;
-      const origDy = offset?.dy ?? 0;
+      const origDx = activeOffset?.dx ?? 0;
+      const origDy = activeOffset?.dy ?? 0;
+      const setActive = ocrMode ? setOcrOffset : setOffset;
+      const posKey = ocrMode ? OCR_POS_STORAGE_KEY : POS_STORAGE_KEY;
 
       const onMove = (ev: MouseEvent) => {
         const ddx = ev.clientX - startX;
@@ -448,7 +1022,7 @@ export function YouTubeEnhancer() {
           dragRef.current.moved = true;
         }
         if (dragRef.current.moved) {
-          setOffset({ dx: origDx + ddx, dy: origDy + ddy });
+          setActive({ dx: origDx + ddx, dy: origDy + ddy });
         }
       };
       const onUp = () => {
@@ -461,7 +1035,7 @@ export function YouTubeEnhancer() {
           const final = latestOffsetRef.current;
           if (final) {
             try {
-              chrome.storage.local.set({ [POS_STORAGE_KEY]: final });
+              chrome.storage.local.set({ [posKey]: final });
             } catch {}
           }
         }
@@ -469,27 +1043,33 @@ export function YouTubeEnhancer() {
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
     },
-    [offset],
+    [activeOffset, ocrMode],
   );
 
   // Track latest offset for the mouseup save (avoids stale closure).
-  const latestOffsetRef = useRef<DragOffset | null>(offset);
+  const latestOffsetRef = useRef<DragOffset | null>(activeOffset);
   useEffect(() => {
-    latestOffsetRef.current = offset;
-  }, [offset]);
+    latestOffsetRef.current = activeOffset;
+  }, [activeOffset]);
 
   function resetPosition() {
-    setOffset(null);
+    (ocrMode ? setOcrOffset : setOffset)(null);
     try {
-      chrome.storage.local.remove(POS_STORAGE_KEY);
+      chrome.storage.local.remove(ocrMode ? OCR_POS_STORAGE_KEY : POS_STORAGE_KEY);
     } catch {}
   }
 
-  function changeTargetLang(lang: LanguageCode) {
+  /** Adopt a (possibly changed) target language from settings. A
+   *  change resets the MAIN world's pinned track — the automatic pick
+   *  re-runs for the new target — so the cue state resets with it.
+   *  Only ever called from async callbacks, so reading the ref mirror
+   *  (kept fresh each render, declared below) is safe. */
+  function applyTargetLang(lang: LanguageCode) {
+    if (targetLangRef.current === lang) return;
     setTargetLang(lang);
-    try {
-      chrome.storage.local.set({ [LANG_STORAGE_KEY]: lang });
-    } catch {}
+    setTrackChoice('auto');
+    trackAdoptableRef.current = true;
+    setAutoEngaged(true);
     setNative([]);
     setTranslated([]);
     setActiveNative(null);
@@ -497,6 +1077,44 @@ export function YouTubeEnhancer() {
     // Also drop the sticky "last cue" memory — keeping the previous
     // language's last line dimmed under a new target language is just
     // confusing (Chinese line still hanging there after switching to ja).
+    lastNativeRef.current = null;
+    lastTranslatedRef.current = null;
+  }
+
+  /** Subtitle menu (YouTube-CC-menu equivalent): pin the native line to
+   *  a real track ("original"), an auto-translate language, burned-in
+   *  OCR, turn the overlay off entirely, or hand the choice back to
+   *  the automatic pick. */
+  function changeTrackChoice(value: string) {
+    setTrackChoice(value);
+    // A user pin freezes the select; picking Auto re-opens it to
+    // auto-pick reflection.
+    trackAdoptableRef.current = value === 'auto';
+    // Optimistic: a pin engages the MAIN world regardless of the
+    // tracklist; re-picking Auto makes it re-evaluate (and it
+    // re-announces hands-off if the verdict still holds).
+    setAutoEngaged(true);
+    let detail: Record<string, string> = { mode: 'auto' };
+    if (value === 'ocr' || value === 'off') {
+      // OCR owns the overlay — park the MAIN world's track steering so
+      // it neither flips the player's CC nor streams timedtext cues.
+      // Off parks it for the same reason: the user asked the extension
+      // to stand down on this video, so no steering and no streaming.
+      detail = { mode: 'suspend' };
+    } else if (value.startsWith('track:')) {
+      const vssId = value.slice('track:'.length);
+      const t = ccTracks.tracks.find((x) => x.vssId === vssId);
+      detail = { mode: 'track', vssId, lang: t?.languageCode || '' };
+    } else if (value.startsWith('tlang:')) {
+      detail = { mode: 'tlang', tlang: value.slice('tlang:'.length) };
+    }
+    window.dispatchEvent(new CustomEvent('tokori-yt-set-track', { detail }));
+    // Same cue reset as a language change — the streams repopulate
+    // from the fresh selection round.
+    setNative([]);
+    setTranslated([]);
+    setActiveNative(null);
+    setActiveTranslated(null);
     lastNativeRef.current = null;
     lastTranslatedRef.current = null;
   }
@@ -726,8 +1344,13 @@ export function YouTubeEnhancer() {
   // Between-cue gaps fall back to the last seen line, shown dimmed.
   // `isLive` distinguishes the two for styling — only a truly active
   // cue gets the "live" treatment. Toggling YouTube's own CC button
-  // off hides the overlay entirely; the transcript sidebar is
-  // independently controlled and survives the toggle.
+  // off hides the ENTIRE on-video overlay — caption lines AND the
+  // toolbar — so nothing of ours floats over a video the user chose to
+  // watch without captions (no hover-revealed bar). Turning CC back on
+  // restores it; OCR mode owns the overlay independently (exempt below)
+  // and stays reachable meanwhile via its dedicated player-bar button.
+  // The transcript sidebar is independently controlled and survives the
+  // toggle too.
   const ccPaused = ccEnabled === false;
   const displayedNative = activeNative || lastNativeRef.current;
   const displayedTranslated = activeTranslated || lastTranslatedRef.current;
@@ -740,19 +1363,48 @@ export function YouTubeEnhancer() {
   // what the user is studying.
   const lang = (displayedNative ? detectLanguage(displayedNative.text) : null) || targetLang;
   const hasAnyCue = !!(displayedNative || displayedTranslated);
-  const overlayVisible = !ccPaused;
+  // Subtitle menu → Off: the user asked the extension's captions off
+  // for this video (resets to Auto on navigation). This is the ONLY
+  // off-switch on videos where YouTube renders no CC button (hidden
+  // auto-generated tracks are common) — ccPaused can never fire there.
+  const overlayOff = trackChoice === 'off';
+  // Auto found no caption track in the target language, so the MAIN
+  // world is hands-off and YouTube's own captions run untouched. The
+  // overlay stays out of the way too: no cue lines are coming, the
+  // toolbar reveals on hover only, and the Subtitle menu explains why.
+  const autoIdle = trackChoice === 'auto' && !autoEngaged;
+  const targetLangName = targetLang
+    ? getLanguage(targetLang)?.name || targetLang
+    : 'target-language';
+  // OCR lines are our own explicit mode — they ignore the CC toggle.
+  const showCueLines = (!ccPaused || ocrMode) && !overlayOff;
+  // The whole on-video bar shares that gate: when the user turns CC off
+  // (on a captioned video) the toolbar comes down with the cue lines —
+  // no bar left hovering over the video. OCR mode keeps it up. Off
+  // keeps the BAR mounted (hover-revealed) so the choice stays
+  // reversible even without a YT CC button to re-summon it with.
+  const showOverlay = showCueLines || overlayOff;
 
   // ── Positioning ────────────────────────────────────────────────
-  // Default anchor = bottom-centre of the player, offset 12% up. When
-  // the user has dragged we layer `offset.dx/dy` on top.
+  // Default anchor = bottom-centre of the player, offset 12% up. In
+  // OCR mode the bar instead sits on the OPPOSITE side of the capture
+  // region — reading bottom-strip subs puts the interactive bar at the
+  // top of the player, so it never covers the burned-in text it is
+  // transcribing. The user's drag offset layers on top either way.
   const anchorStyle: React.CSSProperties = (() => {
+    const region = ocrRegion ?? DEFAULT_OCR_REGION;
+    const barAtTop = ocrMode && region.y + region.h / 2 >= 0.5;
     if (!playerRect) {
-      return { left: '50%', bottom: '12%', transform: 'translateX(-50%)' };
+      return barAtTop
+        ? { left: '50%', top: '10%', transform: 'translateX(-50%)' }
+        : { left: '50%', bottom: '12%', transform: 'translateX(-50%)' };
     }
     const baseX = playerRect.left + playerRect.width / 2;
-    const baseY = playerRect.top + playerRect.height * 0.88; // 12% up from bottom
-    const x = baseX + (offset?.dx ?? 0);
-    const y = baseY + (offset?.dy ?? 0);
+    const baseY = barAtTop
+      ? playerRect.top + playerRect.height * 0.08 // just under the top edge
+      : playerRect.top + playerRect.height * 0.88; // 12% up from bottom
+    const x = baseX + (activeOffset?.dx ?? 0);
+    const y = baseY + (activeOffset?.dy ?? 0);
     // Clamp so the overlay never escapes the player bounds.
     const minX = playerRect.left + 80;
     const maxX = playerRect.right - 80;
@@ -761,17 +1413,26 @@ export function YouTubeEnhancer() {
     return {
       left: clamp(x, minX, maxX),
       top: clamp(y, minY, maxY),
-      transform: 'translate(-50%, -100%)',
+      // Top-anchored bars grow downward; bottom-anchored grow upward.
+      transform: barAtTop ? 'translate(-50%, 0)' : 'translate(-50%, -100%)',
     };
   })();
 
   return (
     <>
+      {selectingRegion && (
+        <OcrRegionSelector
+          current={ocrRegion}
+          onSelect={saveOcrRegion}
+          onCancel={() => setSelectingRegion(false)}
+          videoSelector="#movie_player video"
+        />
+      )}
       <CaptionSidebar
         open={sidebarOpen}
         onClose={() => toggleSidebar(false)}
-        native={native}
-        translated={translated}
+        native={nativeCues}
+        translated={translatedCues}
         activeStart={activeNative?.start ?? null}
         activeTokens={
           activeNative && cueForTokens && cueForTokens.start === activeNative.start
@@ -794,7 +1455,7 @@ export function YouTubeEnhancer() {
         readingFor={(word) => readings.get(word) ?? null}
         onToggleReading={() => patchCaptionStyle({ showReading: !captionStyle.showReading })}
       />
-      {overlayVisible && (
+      {showOverlay && (
         <div
           ref={containerRef}
           className="tk-force-dark"
@@ -812,8 +1473,7 @@ export function YouTubeEnhancer() {
             cursor: 'grab',
           })}
         >
-          {/* Toolbar: target-lang picker + reset. Drag handle removed —
-          drag works anywhere now. */}
+          {/* Toolbar. Drag handle removed — drag works anywhere now. */}
           <div
             style={s({
               display: 'flex',
@@ -821,57 +1481,173 @@ export function YouTubeEnhancer() {
               alignItems: 'center',
               gap: '6px',
               marginBottom: '4px',
-              opacity: hovered || !hasAnyCue ? 1 : 0,
+              // Pinned visible while loading cues on a captioned video
+              // ("something is coming") and while OCR hunts its first
+              // line (the "OCR watching…" status is the feedback).
+              // Otherwise — cues flowing, CC toggled off, subtitles set
+              // to Off, a caption-less video, or a hands-off video (no
+              // target-language track) — reveal on hover only.
+              opacity:
+                hovered ||
+                (!overlayOff &&
+                  ((!hasAnyCue && !ccAbsent && !ccPaused && !autoIdle) || (ocrMode && !hasAnyCue)))
+                  ? 1
+                  : 0,
               transition: 'opacity 120ms ease',
               pointerEvents: 'auto',
             })}
           >
-            <label
-              title="Target language for captions"
-              style={s({
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '4px',
-                background: 'rgba(0,0,0,0.7)',
-                color: '#fff',
-                border: '1px solid rgba(255,255,255,0.15)',
-                borderRadius: '999px',
-                padding: '2px 4px 2px 10px',
-                fontSize: '11px',
-              })}
-            >
-              <span aria-hidden style={{ opacity: 0.7 }}>
-                CC
-              </span>
-              <select
-                value={targetLang ?? ''}
-                onChange={(e) => changeTargetLang(e.target.value as LanguageCode)}
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => e.stopPropagation()}
+            {/* Always rendered: OCR must stay reachable on videos with
+                no caption tracks at all — that's exactly when burned-in
+                subtitles are the only source. */}
+            {
+              <label
+                title="Subtitle source — the video's original caption tracks or an auto-translation, like YouTube's own CC menu. Auto picks for your target language (set in Options) and the menu lands on that pick. OCR reads burned-in (hardcoded) subtitles off the frame (local model or AI key — Options → AI)."
                 style={s({
-                  background: 'transparent',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  background: 'rgba(0,0,0,0.7)',
                   color: '#fff',
-                  border: 'none',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '999px',
+                  padding: '2px 4px 2px 10px',
                   fontSize: '11px',
-                  outline: 'none',
-                  cursor: 'pointer',
-                  padding: '0 2px',
                 })}
               >
-                {!targetLang && (
-                  <option value="" disabled>
-                    —
+                <span aria-hidden style={{ opacity: 0.7 }}>
+                  Subtitle
+                </span>
+                <select
+                  value={trackChoice}
+                  onChange={(e) => changeTrackChoice(e.target.value)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => e.stopPropagation()}
+                  style={s({
+                    background: 'transparent',
+                    color: '#fff',
+                    border: 'none',
+                    fontSize: '11px',
+                    outline: 'none',
+                    cursor: 'pointer',
+                    padding: '0 2px',
+                    // The auto-translate list is ~130 entries with long
+                    // names — cap the closed control so the pill stays
+                    // compact (the open dropdown shows full labels).
+                    // 130px matches the streaming toolbar's selects;
+                    // the closed control now usually shows a language
+                    // name (the reflected auto pick), not "Auto".
+                    maxWidth: '130px',
+                  })}
+                >
+                  {/* The extension's own off-switch. Essential on videos
+                      where YouTube renders no CC button (hidden auto-gen
+                      tracks): ccPaused can never fire there, so without
+                      this the overlay would be impossible to dismiss. */}
+                  <option value="off" style={{ background: '#111' }}>
+                    Off
                   </option>
-                )}
-                {LANGUAGES.map((l) => (
-                  <option key={l.code} value={l.code} style={{ background: '#111' }}>
-                    {l.name}
+                  <option value="auto" style={{ background: '#111' }}>
+                    {autoIdle ? `Auto (no ${targetLangName} CC)` : 'Auto'}
                   </option>
-                ))}
-              </select>
-            </label>
+                  <option value="ocr" style={{ background: '#111' }}>
+                    OCR: burned-in subs (AI)
+                  </option>
+                  {ccTracks.tracks.length > 0 && (
+                    <optgroup label="Captions" style={{ background: '#111' }}>
+                      {ccTracks.tracks.map((t) => (
+                        <option
+                          key={t.vssId || t.languageCode}
+                          value={`track:${t.vssId}`}
+                          style={{ background: '#111' }}
+                        >
+                          {t.label}
+                          {/* Tracklists read from getPlayerResponse already
+                              carry a localized "(auto-generated)" in the
+                              label — don't stack a second one. */}
+                          {t.kind === 'asr' && !/auto/i.test(t.label) ? ' (auto-generated)' : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {ccTracks.translations.length > 0 && (
+                    <optgroup label="Auto-translate" style={{ background: '#111' }}>
+                      {ccTracks.translations.map((l) => (
+                        <option
+                          key={l.code}
+                          value={`tlang:${l.code}`}
+                          style={{ background: '#111' }}
+                        >
+                          {l.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+              </label>
+            }
 
-            {offset && (
+            {autoIdle && (
+              <span
+                title={`This video has no ${targetLangName} caption track, so Tokori is leaving YouTube's own subtitles alone. To study it anyway, pick a source from the Subtitle menu: an Auto-translate language, a caption track as-is, or OCR for burned-in subs.`}
+                style={s({
+                  background: 'rgba(0,0,0,0.5)',
+                  color: TOKENS.textMuted,
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: '999px',
+                  padding: '2px 8px',
+                  fontSize: '10px',
+                  cursor: 'help',
+                })}
+              >
+                No {targetLangName} CC
+              </span>
+            )}
+
+            {ocrMode && (
+              <span
+                title={
+                  ocr.error
+                    ? `OCR problem — ${ocr.error}`
+                    : 'Reading burned-in subtitles from the video frame with your OCR engine (local model or AI key — Options → AI); the translation line uses your translate engine.'
+                }
+                style={s({
+                  background: 'rgba(0,0,0,0.5)',
+                  color: ocr.error ? '#fbbf24' : TOKENS.textMuted,
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: '999px',
+                  padding: '2px 8px',
+                  fontSize: '10px',
+                  cursor: 'help',
+                })}
+              >
+                {ocr.error ? '⚠ OCR' : nativeCues.length > 0 ? 'OCR live' : 'OCR watching…'}
+              </span>
+            )}
+
+            {ocrMode && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelectingRegion(true);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                title="Choose where on the video the burned-in subtitles are — the OCR only reads that area"
+                style={s({
+                  background: 'rgba(0,0,0,0.7)',
+                  color: '#fff',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '999px',
+                  padding: '3px 10px',
+                  fontSize: '11px',
+                  cursor: 'pointer',
+                })}
+              >
+                ⛶ Region
+              </button>
+            )}
+
+            {activeOffset && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -917,22 +1693,19 @@ export function YouTubeEnhancer() {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                const next = !blurTranslated;
-                setBlurTranslated(next);
-                if (!next) setRevealedCueStart(null);
-                try {
-                  chrome.storage.local.set({ [BLUR_TRANSLATED_KEY]: next });
-                } catch {}
+                cycleEnMode();
               }}
               onMouseDown={(e) => e.stopPropagation()}
               title={
-                blurTranslated
-                  ? 'Translated subtitles are blurred — click to reveal each line'
-                  : 'Translated subtitles are always visible'
+                enMode === 'blur'
+                  ? 'EN line is blurred — click a line to reveal it. Click here for: off'
+                  : enMode === 'show'
+                    ? 'EN line is always visible. Click here for: blurred'
+                    : 'EN line is OFF — nothing is translated or shown. Click here for: visible'
               }
               style={s({
-                background: blurTranslated ? 'rgba(0,0,0,0.7)' : 'rgba(0,0,0,0.5)',
-                color: blurTranslated ? '#fff' : TOKENS.textMuted,
+                background: enMode !== 'off' ? 'rgba(0,0,0,0.7)' : 'rgba(0,0,0,0.5)',
+                color: enMode !== 'off' ? '#fff' : TOKENS.textMuted,
                 border: '1px solid rgba(255,255,255,0.15)',
                 borderRadius: '999px',
                 padding: '3px 10px',
@@ -940,7 +1713,7 @@ export function YouTubeEnhancer() {
                 cursor: 'pointer',
               })}
             >
-              Blur EN: {blurTranslated ? 'on' : 'off'}
+              EN: {enMode}
             </button>
 
             <button
@@ -993,6 +1766,53 @@ export function YouTubeEnhancer() {
             >
               <span aria-hidden>⛏</span>
               <span>Mine</span>
+            </button>
+
+            {/* Add-to-library moved into YouTube's own action bar (the
+                portal below) — always visible there, not just while
+                the caption overlay is up. */}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleTimer();
+              }}
+              onMouseDown={(e) => e.stopPropagation()}
+              title={
+                timerIdle
+                  ? "Immersion timer running, but not counting — this video isn't in your Tokori library. Add it (＋ Tokori) to count it, or click to stop the session."
+                  : timerPaused
+                    ? 'Immersion timer paused (video paused, or paused from the Tokori desktop sidebar). Play the video to resume, or click to stop and log the session.'
+                    : immersion.active
+                      ? 'Immersion timer running — click to stop and log the session'
+                      : 'Start the immersion timer (study mode). Time only counts while a library video plays; see Stats in the extension popup.'
+              }
+              aria-label={immersion.active ? 'Stop immersion timer' : 'Start immersion timer'}
+              style={s({
+                background:
+                  timerIdle || timerPaused
+                    ? 'rgba(251,191,36,0.2)'
+                    : immersion.active
+                      ? 'rgba(16,185,129,0.25)'
+                      : 'rgba(0,0,0,0.7)',
+                color: '#fff',
+                border:
+                  timerIdle || timerPaused
+                    ? '1px solid rgba(251,191,36,0.55)'
+                    : immersion.active
+                      ? '1px solid rgba(16,185,129,0.6)'
+                      : '1px solid rgba(255,255,255,0.15)',
+                borderRadius: '999px',
+                padding: '3px 10px',
+                fontSize: '11px',
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '4px',
+                fontVariantNumeric: 'tabular-nums',
+              })}
+            >
+              <span aria-hidden>{timerIdle || timerPaused ? '⏸' : '⏱'}</span>
+              <span>{immersion.active ? formatTimer(immersion.ms) : 'Immerse'}</span>
             </button>
 
             <button
@@ -1062,7 +1882,7 @@ export function YouTubeEnhancer() {
               so each gets its own block-level row — otherwise two short
               lines fit side by side and the English ends up NEXT TO the
               native line instead of under it. */}
-          {displayedNative && lang && (
+          {showCueLines && displayedNative && lang && (
             <div>
               <div
                 ref={nativeBoxRef}
@@ -1152,8 +1972,8 @@ export function YouTubeEnhancer() {
                           lang,
                           // Full cue list + position → the analyzer's ‹ ›
                           // pager can walk subtitle lines and seek along.
-                          cues: native.map((c) => ({ text: c.text, start: c.start })),
-                          index: native.findIndex((c) => c.start === displayedNative.start),
+                          cues: nativeCues.map((c) => ({ text: c.text, start: c.start })),
+                          index: nativeCues.findIndex((c) => c.start === displayedNative.start),
                         },
                       }),
                     );
@@ -1177,7 +1997,9 @@ export function YouTubeEnhancer() {
               language subtitle and never appears alone in its place
               (track timings can briefly produce a translated cue with no
               matching native one). */}
-          {displayedTranslated &&
+          {showCueLines &&
+            enMode !== 'off' &&
+            displayedTranslated &&
             displayedNative &&
             (() => {
               const isRevealed =
@@ -1220,6 +2042,121 @@ export function YouTubeEnhancer() {
             })()}
         </div>
       )}
+
+      {/* Native action-bar buttons — rendered into YouTube's own
+          like/Share row via the portal container the attach loop
+          maintains. Styled as YT chips so they read as part of the
+          page, not an overlay. */}
+      {actionBarEl &&
+        createPortal(
+          <NativeBarButtons
+            listState={listState}
+            listError={listError}
+            onAdd={addToWatchList}
+            timerActive={immersion.active}
+            timerIdle={timerIdle}
+            timerPaused={timerPaused}
+            timerMs={immersion.ms}
+            onToggleTimer={toggleTimer}
+          />,
+          actionBarEl,
+        )}
+    </>
+  );
+}
+
+/** The two chips injected into YouTube's action row. Colors follow
+ *  YT's own light/dark chips (html[dark]) rather than our overlay
+ *  tokens, so they sit next to like/Share without looking pasted on. */
+function NativeBarButtons({
+  listState,
+  listError,
+  onAdd,
+  timerActive,
+  timerIdle,
+  timerPaused,
+  timerMs,
+  onToggleTimer,
+}: {
+  listState: 'hidden' | 'out' | 'busy' | 'in';
+  listError: string | null;
+  onAdd: () => void;
+  timerActive: boolean;
+  /** Running but not counting — the current video isn't a library item. */
+  timerIdle: boolean;
+  /** Running but frozen — video paused or paused from the desktop. */
+  timerPaused: boolean;
+  timerMs: number;
+  onToggleTimer: () => void;
+}) {
+  const dark = document.documentElement.hasAttribute('dark');
+  const chip = (active: boolean): CSSProperties => ({
+    height: '36px',
+    borderRadius: '18px',
+    padding: '0 14px',
+    border: 'none',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontFamily: '"Roboto","Arial",sans-serif',
+    fontSize: '14px',
+    fontWeight: 500,
+    lineHeight: '36px',
+    whiteSpace: 'nowrap',
+    cursor: 'pointer',
+    background: active
+      ? 'rgba(16,185,129,0.18)'
+      : dark
+        ? 'rgba(255,255,255,0.1)'
+        : 'rgba(0,0,0,0.05)',
+    color: active ? (dark ? '#34d399' : '#047857') : dark ? '#f1f1f1' : '#0f0f0f',
+    fontVariantNumeric: 'tabular-nums',
+  });
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onAdd}
+        disabled={listState === 'busy' || listState === 'in'}
+        title={
+          listError
+            ? `Couldn't add to your library — ${listError}`
+            : listState === 'in'
+              ? 'In your Tokori library — the immersion timer auto-starts and tracks your progress'
+              : 'Add this video to your Tokori library (progress tracks while the timer runs)'
+        }
+        aria-label={listState === 'in' ? 'In your Tokori library' : 'Add to Tokori library'}
+        style={{
+          ...chip(listState === 'in'),
+          cursor: listState === 'out' ? 'pointer' : 'default',
+        }}
+      >
+        <span aria-hidden>{listState === 'in' ? '✓' : '＋'}</span>
+        <span>{listState === 'in' ? 'Tokori' : listState === 'busy' ? 'Adding…' : 'Tokori'}</span>
+      </button>
+      <button
+        type="button"
+        onClick={onToggleTimer}
+        title={
+          timerIdle
+            ? "Immersion timer running, but not counting — this video isn't in your Tokori library. Add it to count it, or click to stop the session."
+            : timerPaused
+              ? 'Immersion timer paused (video paused, or paused from the Tokori desktop sidebar). Play the video to resume, or click to stop and log the session.'
+              : timerActive
+                ? 'Immersion timer running — click to stop and log the session'
+                : 'Start the immersion timer (study mode). Time only counts while a library video plays.'
+        }
+        aria-label={timerActive ? 'Stop immersion timer' : 'Start immersion timer'}
+        style={{
+          ...chip(timerActive && !timerIdle && !timerPaused),
+          ...(timerIdle || timerPaused
+            ? { background: 'rgba(251,191,36,0.18)', color: dark ? '#fbbf24' : '#92400e' }
+            : {}),
+        }}
+      >
+        <span aria-hidden>{timerIdle || timerPaused ? '⏸' : '⏱'}</span>
+        <span>{timerActive ? formatTimer(timerMs) : 'Immerse'}</span>
+      </button>
     </>
   );
 }
@@ -1235,6 +2172,18 @@ function findCue(cues: Cue[], t: number): Cue | null {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/** Best-effort channel-name scrape for the watch-list "author" field.
+ *  YT rearranges these nodes across experiments — every selector is a
+ *  fallback, and `undefined` (no author) is a fine outcome. */
+function scrapeChannelName(): string | undefined {
+  const el =
+    document.querySelector('#above-the-fold ytd-channel-name a') ||
+    document.querySelector('ytd-video-owner-renderer ytd-channel-name a') ||
+    document.querySelector('#owner #channel-name a');
+  const name = el?.textContent?.trim();
+  return name || undefined;
 }
 
 // Caption tokeniser (Token, tokenize, segmentText) now lives in

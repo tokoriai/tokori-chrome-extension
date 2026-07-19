@@ -206,6 +206,12 @@ export function YouTubeEnhancer() {
    *  tracks — the OCR mode's home turf). The toolbar then reveals on
    *  hover only, instead of floating permanently over every video. */
   const [ccAbsent, setCcAbsent] = useState(false);
+  /** Brief toolbar pin after the MAIN world announces hands-off (no
+   *  target-language track): without it the only trace of the
+   *  extension on out-of-language videos is a hover-revealed bar,
+   *  which reads as "stopped working". Armed by onTrackStatus. */
+  const [autoIdleFlash, setAutoIdleFlash] = useState(false);
+  const idleFlashTimerRef = useRef<number | null>(null);
   /** Burned-in subtitle capture (player-bar OCR button / Subtitle menu
    *  → OCR). While it owns the overlay, the cue lists below come from
    *  frame OCR instead of the timedtext streams. Deliberately NOT
@@ -506,6 +512,7 @@ export function YouTubeEnhancer() {
         setNative(ce.detail.cues);
         // Native cues flowing = the MAIN world owns this video after all.
         setAutoEngaged(true);
+        setAutoIdleFlash(false);
       }
     };
     const onTranslated = (e: Event) => {
@@ -530,6 +537,12 @@ export function YouTubeEnhancer() {
       setActiveTranslated(null);
       lastNativeRef.current = null;
       lastTranslatedRef.current = null;
+      // Surface the verdict: pin the toolbar for a few seconds so the
+      // "No {lang} CC" pill and the Subtitle menu are seen, then fall
+      // back to hover-reveal.
+      setAutoIdleFlash(true);
+      if (idleFlashTimerRef.current) window.clearTimeout(idleFlashTimerRef.current);
+      idleFlashTimerRef.current = window.setTimeout(() => setAutoIdleFlash(false), 6000);
     };
     const onTracks = (e: Event) => {
       const ce = e as CustomEvent<{
@@ -1509,6 +1522,7 @@ export function YouTubeEnhancer() {
               // target-language track) — reveal on hover only.
               opacity:
                 hovered ||
+                autoIdleFlash ||
                 (!overlayOff &&
                   ((!hasAnyCue && !ccAbsent && !ccPaused && !autoIdle) || (ocrMode && !hasAnyCue)))
                   ? 1

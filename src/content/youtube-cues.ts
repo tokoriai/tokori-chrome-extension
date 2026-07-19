@@ -670,7 +670,15 @@ function setNativeCcHidden(hidden: boolean) {
 function setPlayerTrack(player: YTPlayer, track: unknown) {
   player.setOption?.('captions', 'track', track);
   const tl = (track as TrackInfo | null | undefined)?.translationLanguage?.languageCode;
-  setNativeCcHidden(!!tl);
+  // Hide YouTube's own caption rendering while a machine translation is
+  // active — AND while the RESTING pick is one, even if this particular
+  // switch is a real-track excursion: flashing the raw display-language
+  // track for the excursion's 4s window reads as "captions flicker on
+  // and off" mid-study. A real-track RESTING keeps native rendering as
+  // the fallback while our cues load, same as always.
+  const restingTl = (currentRestingTrack as TrackInfo | null | undefined)?.translationLanguage
+    ?.languageCode;
+  setNativeCcHidden(!!tl || !!restingTl);
 }
 
 /** True while the "briefly switch to the translated track" excursion is
@@ -768,6 +776,9 @@ function enterHandsOff(player: YTPlayer) {
   const vid = getVideoId();
   if (handsOffFor === vid) return;
   handsOffFor = vid;
+  // Stop treating the abandoned resting pick as "ours" — it would keep
+  // the translated-CC hide latched through the unwind below.
+  currentRestingTrack = null;
   try {
     const cur = player.getOption?.('captions', 'track') as TrackInfo | undefined;
     if (cur?.translationLanguage?.languageCode) {
@@ -952,20 +963,28 @@ function selectForTarget(target: string) {
       !rateLimited() &&
       flipsThisVideo < FLIP_BUDGET_PER_VIDEO
     ) {
-      const realDisplay = tracklist.find(
-        (t) => !t.kind && matchesLang(t.languageCode || '', DISPLAY_LANG),
-      );
+      // A real display-language track — human subs preferred, but an
+      // auto-generated one serves the line just as well (classify
+      // accepts plain lang=en as 'translated'), and on en-asr-only
+      // videos it is the ONLY source that isn't a pointless en→en
+      // translation.
+      const realDisplay =
+        tracklist.find((t) => !t.kind && matchesLang(t.languageCode || '', DISPLAY_LANG)) ||
+        tracklist.find((t) => matchesLang(t.languageCode || '', DISPLAY_LANG));
       const displayCode = resolveTranslateCode(player, DISPLAY_LANG);
       // Translate excursions only when the player actually offers the
       // display language — an unlisted tlang fetches nothing and burns
-      // the flip budget for it.
+      // the flip budget for it. Never translate a source that already
+      // IS the display language.
       const displayOffered = translationOffered(player, DISPLAY_LANG);
+      const inDisplayLang = (t: TrackInfo | null) =>
+        !!t && matchesLang(t.languageCode || '', DISPLAY_LANG);
       const strategies: unknown[] = [];
-      if (prefixMatch && displayOffered) {
+      if (prefixMatch && displayOffered && !inDisplayLang(prefixMatch)) {
         strategies.push(makeTranslationTrack(player, prefixMatch, displayCode));
       }
       if (realDisplay) strategies.push(realDisplay);
-      if (base && base !== prefixMatch && displayOffered) {
+      if (base && base !== prefixMatch && displayOffered && !inDisplayLang(base)) {
         strategies.push(makeTranslationTrack(player, base, displayCode));
       }
       if (!strategies.length) return true;
@@ -995,14 +1014,16 @@ function selectForTarget(target: string) {
  *  target-language entry instead of resting on an opaque "Auto".
  *  Reflection only — the overlay adopts the value without pinning, so
  *  this script's fallback ladder stays live. */
+let lastAutoPickValue = '';
 function publishAutoPick(resting: unknown) {
   const vid = getVideoId();
   if (!vid) return;
   const t = resting as TrackInfo;
   const tl = t.translationLanguage?.languageCode;
+  lastAutoPickValue = tl ? `tlang:${tl}` : `track:${t.vssId || ''}`;
   window.dispatchEvent(
     new CustomEvent('tokori-yt-auto-pick', {
-      detail: { videoId: vid, value: tl ? `tlang:${tl}` : `track:${t.vssId || ''}` },
+      detail: { videoId: vid, value: lastAutoPickValue },
     }),
   );
 }
@@ -1379,6 +1400,21 @@ function pollCcButtonState() {
   // retry loop stops once cues are flowing, but a late-loading
   // tracklist (or a CC-off video) should still populate the subtitle menu.
   publishTracks();
+  // A machine-translated track can be ACTIVE before our first steer —
+  // the player restores it from the sticky caption preference of a
+  // previous video — and YouTube renders those itself, sometimes as the
+  // entire transcript piled on screen. Hide it as soon as we see it;
+  // hands-off entry unwinds the track (and releases the hide), and our
+  // own steering keeps the style in sync from then on.
+  if (!autoHandsOff && !ccUserOff && !selectionSuspended && nativeOverride.mode === 'auto') {
+    try {
+      const p = ytPlayerEl() as unknown as YTPlayer | null;
+      const cur = p?.getOption?.('captions', 'track') as TrackInfo | undefined;
+      if (cur?.translationLanguage?.languageCode) setNativeCcHidden(true);
+    } catch {
+      /* player not ready yet */
+    }
+  }
   // Scope to the active player — hover previews / miniplayers mount
   // their own `.ytp-subtitles-button`, and a bare querySelector can
   // land on one of those and report the wrong state. Shorts pages have
@@ -1514,6 +1550,29 @@ const menuTrackKey = (t: unknown): string => {
   const x = (t ?? {}) as TrackInfo;
   return `${x.vssId || ''}|${x.translationLanguage?.languageCode || ''}`;
 };
+/** Loose "is this the track WE set?" identity. Tracks built from the
+ *  getPlayerResponse fallback list carry EMPTY vssIds while the player
+ *  reports the canonical one ('a.en') — raw key equality then reads our
+ *  own resting pick as a user pick, and the resulting adoption loop
+ *  cleared cue state every few seconds: the EN line died after the
+ *  first stretch, captions flickered on/off, and YouTube's native
+ *  pile-up rendering flashed through. Compare vssId only when both
+ *  sides have one; otherwise fall back to language + kind. The
+ *  translation target must match either way. */
+function sameTrackIdentity(
+  a: TrackInfo | null | undefined,
+  b: TrackInfo | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  const atl = (a.translationLanguage?.languageCode || '').toLowerCase();
+  const btl = (b.translationLanguage?.languageCode || '').toLowerCase();
+  if (atl !== btl) return false;
+  if (a.vssId && b.vssId) return a.vssId === b.vssId;
+  return (
+    (a.languageCode || '').toLowerCase() === (b.languageCode || '').toLowerCase() &&
+    (a.kind || '') === (b.kind || '')
+  );
+}
 let lastMenuKey = '';
 let menuKeyStreak = 0;
 function pollNativeMenuPick() {
@@ -1529,7 +1588,16 @@ function pollNativeMenuPick() {
     const tl = cur?.translationLanguage?.languageCode || '';
     if (!cur || (!cur.vssId && !tl)) return;
     const curKey = menuTrackKey(cur);
-    if (curKey === menuTrackKey(currentRestingTrack)) {
+    if (sameTrackIdentity(cur, currentRestingTrack as TrackInfo | null)) {
+      menuKeyStreak = 0;
+      lastMenuKey = curKey;
+      return;
+    }
+    // Same value the automatic pick already published ⇒ nothing the
+    // user could have meaningfully changed — adopting it as a pin
+    // would only clear cue state for a no-op.
+    const curValue = tl ? `tlang:${tl}` : `track:${cur.vssId || ''}`;
+    if (curValue === lastAutoPickValue) {
       menuKeyStreak = 0;
       lastMenuKey = curKey;
       return;

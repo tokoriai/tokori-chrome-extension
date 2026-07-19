@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "No Chinese CC" pill) before falling back to hover-reveal, instead of
   being indistinguishable from not running.
 
+### Fixed
+
+- The YouTube-menu mirror could adopt the extension's OWN track pick as
+  a "user pick from YouTube's menu", in a loop: current player builds
+  expose the tracklist only through `getPlayerResponse`, whose entries
+  carry empty `vssId`s, so the "is this the track we set?" comparison
+  never matched. Every few seconds the false adoption cleared cue state
+  (the English line died after its first stretch), re-set the track
+  (captions flickered off and on), and briefly let YouTube's own
+  pile-the-whole-transcript rendering of machine translations show
+  through. Track identity now falls back to language + kind when either
+  side lacks a `vssId`, and a pick equal to the published automatic one
+  is never adopted.
+- YouTube's native caption rendering now stays hidden across the whole
+  translated-resting round — including the excursions that briefly
+  switch to a real display-language track — and a machine-translated
+  track left active by the sticky caption preference is hidden the
+  moment it's seen, closing the transcript pile-up flash between page
+  load and the first steer.
+- The English-line hunt no longer wastes excursions translating a track
+  into its own language, and an auto-generated display-language track
+  now serves the line directly on videos that have no human one.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added
